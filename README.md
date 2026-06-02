@@ -9,7 +9,7 @@
 - 出力: transcript、instruction draft、JSON/text handoff
 - 境界: gesture、network adapter、agent backend の実装は持たず、外部側が `input_enabled` や保存済み handoff を介して接続する
 
-## 最小セットアップ
+## 初期セットアップ
 
 ```bash
 uv sync
@@ -32,7 +32,18 @@ Windows では `ffmpeg` を `PATH` に入れたうえで、必要に応じて he
 
 Whisper モデルは初回実行時に `models/whisper/` へ取得されます。モデルファイル、`.venv/`、`.cache/` はソースとして扱いません。
 
-## 起動と確認
+## dotenv / local config
+
+通常のローカル起動では `.env` ファイルは必須ではありません。保護 API を固定 token で使う場合だけ、
+起動プロセスの環境変数として `AI_TALK_CORE_WEB_TOKEN` を渡します。
+
+```powershell
+$env:AI_TALK_CORE_WEB_TOKEN = "local-dev-token"
+```
+
+実トークン、録音データ、Whisper モデル、`.cache/`、`.venv/` はコミットしません。
+
+## 通常起動と確認
 
 Web UI / JSON API:
 
