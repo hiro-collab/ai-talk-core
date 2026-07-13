@@ -75,6 +75,11 @@ from src.io.audio import should_retry_model_load_on_cpu
 from src.io.audio import AudioInputError
 from src.io.audio import AudioEnvironmentError
 from src.io.audio import get_runtime_status
+from src.io.aec_reference import (
+    AecReferenceError,
+    evaluate_synthetic_aec_candidate,
+    select_synthetic_aec_owner,
+)
 from src.io.microphone import (
     MICROPHONE_DEVICE_LIST_TIMEOUT_SECONDS,
     get_microphone_runtime_status,
@@ -236,6 +241,360 @@ class SmokeTests(unittest.TestCase):
         result = run_cli("data/sample_audio.mp3", "--language", "ja")
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("こんにちは", result.stdout)
+
+    def test_synthetic_aec_selects_one_owner_without_retaining_audio(self) -> None:
+        """Synthetic metrics may select one owner but never gain live authority."""
+        reference = [0.4, -0.4, 0.4, -0.4]
+        near_end = [0.2, 0.2, -0.2, -0.2]
+        microphone = [left + right for left, right in zip(reference, near_end)]
+        windows_processed = [
+            near + (0.1 * render) for near, render in zip(near_end, reference)
+        ]
+        webrtc_processed = [
+            near + (0.2 * render) for near, render in zip(near_end, reference)
+        ]
+        candidates = [
+            evaluate_synthetic_aec_candidate(
+                owner_class="windows_voice_capture_dsp",
+                reference_samples=reference,
+                near_end_samples=near_end,
+                microphone_samples=microphone,
+                processed_samples=windows_processed,
+            ),
+            evaluate_synthetic_aec_candidate(
+                owner_class="webrtc_apm_aec3",
+                reference_samples=reference,
+                near_end_samples=near_end,
+                microphone_samples=microphone,
+                processed_samples=webrtc_processed,
+            ),
+        ]
+        self.assertEqual(candidates[0]["echo_convergence_db"], 20.0)
+        self.assertEqual(candidates[1]["echo_convergence_db"], 13.979)
+        self.assertEqual(candidates[0]["near_end_preservation_ratio"], 1.0)
+        self.assertEqual(candidates[1]["near_end_preservation_ratio"], 1.0)
+
+        result = select_synthetic_aec_owner(
+            processing_inventory_class="known_no_owner",
+            active_owner_classes=[],
+            candidates=candidates,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "schema_version": "synthetic_aec_owner_selection.v0",
+                "proof_ceiling": "synthetic_aec_owner_selection_only",
+                "result_class": "synthetic_aec_owner_selected",
+                "processing_inventory_class": "known_no_owner",
+                "candidate_count": 2,
+                "selected_owner_class": "windows_voice_capture_dsp",
+                "selected_echo_convergence_db": 20.0,
+                "selected_near_end_preservation_ratio": 1.0,
+                "exactly_one_aec_owner": True,
+                "observation_only": False,
+                "render_reference_may_create_turn_input": False,
+                "raw_audio_persisted": False,
+                "live_audio_used": False,
+            },
+        )
+        self.assertNotIn("reference_samples", result)
+        self.assertNotIn("processed_samples", result)
+
+    def test_synthetic_aec_fails_closed_for_unknown_double_and_ambiguous(self) -> None:
+        """Unknown, double-owner, and tied candidates remain observation-only."""
+        tied_candidates = [
+            {
+                "owner_class": "windows_voice_capture_dsp",
+                "echo_convergence_db": 12.0,
+                "near_end_preservation_ratio": 0.95,
+            },
+            {
+                "owner_class": "webrtc_apm_aec3",
+                "echo_convergence_db": 12.0,
+                "near_end_preservation_ratio": 0.95,
+            },
+        ]
+        cases = (
+            (
+                "unknown",
+                [],
+                "aec_processing_unknown_observation_only",
+            ),
+            (
+                "double_owner",
+                ["windows_voice_capture_dsp", "webrtc_apm_aec3"],
+                "aec_double_owner_rejected",
+            ),
+            (
+                "known_no_owner",
+                [],
+                "synthetic_aec_owner_ambiguous",
+            ),
+        )
+        for inventory, active, expected in cases:
+            with self.subTest(expected=expected):
+                result = select_synthetic_aec_owner(
+                    processing_inventory_class=inventory,
+                    active_owner_classes=active,
+                    candidates=tied_candidates,
+                )
+                self.assertEqual(result["result_class"], expected)
+                self.assertIsNone(result["selected_owner_class"])
+                self.assertFalse(result["exactly_one_aec_owner"])
+                self.assertTrue(result["observation_only"])
+                self.assertFalse(result["render_reference_may_create_turn_input"])
+
+    def test_synthetic_aec_rejects_private_or_nonseparable_inputs(self) -> None:
+        """Invalid owner text and coupled fixtures return only fixed failures."""
+        with self.assertRaisesRegex(AecReferenceError, "^aec_owner_class_invalid$"):
+            evaluate_synthetic_aec_candidate(
+                owner_class=r"private C:\\audio\\device",
+                reference_samples=[0.4, -0.4, 0.4, -0.4],
+                near_end_samples=[0.2, 0.2, -0.2, -0.2],
+                microphone_samples=[0.6, -0.2, 0.2, -0.6],
+                processed_samples=[0.24, 0.16, -0.16, -0.24],
+            )
+        with self.assertRaisesRegex(
+            AecReferenceError,
+            "^synthetic_aec_fixture_not_separable$",
+        ):
+            evaluate_synthetic_aec_candidate(
+                owner_class="windows_voice_capture_dsp",
+                reference_samples=[0.4, -0.4, 0.4, -0.4],
+                near_end_samples=[0.2, -0.2, 0.2, -0.2],
+                microphone_samples=[0.6, -0.6, 0.6, -0.6],
+                processed_samples=[0.24, -0.24, 0.24, -0.24],
+            )
+
+    def test_synthetic_aec_any_malformed_candidate_blocks_valid_subset(self) -> None:
+        """One malformed candidate invalidates the whole comparison set."""
+        valid = {
+            "owner_class": "windows_voice_capture_dsp",
+            "echo_convergence_db": 20.0,
+            "near_end_preservation_ratio": 1.0,
+        }
+        malformed_candidates = (
+            {
+                "owner_class": "windows_voice_capture_dsp",
+                "echo_convergence_db": "private-same-owner-marker",
+                "near_end_preservation_ratio": 1.0,
+            },
+            {
+                "owner_class": "webrtc_apm_aec3",
+                "echo_convergence_db": 13.979,
+                "near_end_preservation_ratio": "private-other-owner-marker",
+            },
+        )
+        for malformed in malformed_candidates:
+            with self.subTest(owner=malformed["owner_class"]):
+                result = select_synthetic_aec_owner(
+                    processing_inventory_class="known_no_owner",
+                    active_owner_classes=[],
+                    candidates=[valid, malformed],
+                )
+                self.assertEqual(
+                    result["result_class"],
+                    "synthetic_aec_candidate_invalid_observation_only",
+                )
+                self.assertEqual(result["candidate_count"], 2)
+                self.assertIsNone(result["selected_owner_class"])
+                self.assertTrue(result["observation_only"])
+                rendered = repr(result)
+                self.assertNotIn("private-same-owner-marker", rendered)
+                self.assertNotIn("private-other-owner-marker", rendered)
+
+    def test_synthetic_aec_active_owner_mismatch_is_observation_only(self) -> None:
+        """A synthetic winner cannot silently replace the one active owner."""
+        result = select_synthetic_aec_owner(
+            processing_inventory_class="known_single_owner",
+            active_owner_classes=["webrtc_apm_aec3"],
+            candidates=[
+                {
+                    "owner_class": "windows_voice_capture_dsp",
+                    "echo_convergence_db": 18.0,
+                    "near_end_preservation_ratio": 0.98,
+                }
+            ],
+        )
+        self.assertEqual(
+            result["result_class"],
+            "aec_active_owner_mismatch_observation_only",
+        )
+        self.assertIsNone(result["selected_owner_class"])
+        self.assertTrue(result["observation_only"])
+
+    def test_synthetic_aec_duplicate_owner_is_ambiguous(self) -> None:
+        """Two summaries for one owner cannot masquerade as a comparison."""
+        result = select_synthetic_aec_owner(
+            processing_inventory_class="known_no_owner",
+            active_owner_classes=[],
+            candidates=[
+                {
+                    "owner_class": "windows_voice_capture_dsp",
+                    "echo_convergence_db": 20.0,
+                    "near_end_preservation_ratio": 1.0,
+                },
+                {
+                    "owner_class": "windows_voice_capture_dsp",
+                    "echo_convergence_db": 15.0,
+                    "near_end_preservation_ratio": 0.95,
+                },
+            ],
+        )
+        self.assertEqual(result["result_class"], "synthetic_aec_owner_ambiguous")
+        self.assertIsNone(result["selected_owner_class"])
+        self.assertTrue(result["observation_only"])
+
+    def test_synthetic_aec_requires_near_end_preservation(self) -> None:
+        """Echo reduction cannot qualify a candidate that suppresses near-end speech."""
+        reference = [0.4, -0.4, 0.4, -0.4]
+        near_end = [0.2, 0.2, -0.2, -0.2]
+        candidate = evaluate_synthetic_aec_candidate(
+            owner_class="windows_voice_capture_dsp",
+            reference_samples=reference,
+            near_end_samples=near_end,
+            microphone_samples=[
+                render + near for render, near in zip(reference, near_end)
+            ],
+            processed_samples=[
+                (0.02 * render) + (0.7 * near)
+                for render, near in zip(reference, near_end)
+            ],
+        )
+        self.assertGreater(candidate["echo_convergence_db"], 20)
+        self.assertEqual(candidate["near_end_preservation_ratio"], 0.7)
+
+        result = select_synthetic_aec_owner(
+            processing_inventory_class="known_no_owner",
+            active_owner_classes=[],
+            candidates=[candidate],
+        )
+        self.assertEqual(
+            result["result_class"], "synthetic_aec_candidate_unqualified"
+        )
+        self.assertIsNone(result["selected_owner_class"])
+        self.assertTrue(result["observation_only"])
+
+    def test_synthetic_aec_selection_threshold_boundaries(self) -> None:
+        """Convergence, preservation, and winner margin boundaries are exact."""
+
+        def candidate(owner: str, convergence: float, preservation: float) -> dict:
+            return {
+                "owner_class": owner,
+                "echo_convergence_db": convergence,
+                "near_end_preservation_ratio": preservation,
+            }
+
+        single_cases = (
+            (6.0, 1.0, "synthetic_aec_owner_selected"),
+            (5.999, 1.0, "synthetic_aec_candidate_unqualified"),
+            (30.0, 0.85, "synthetic_aec_owner_selected"),
+            (30.0, 0.849, "synthetic_aec_candidate_unqualified"),
+        )
+        for convergence, preservation, expected in single_cases:
+            with self.subTest(convergence=convergence, preservation=preservation):
+                result = select_synthetic_aec_owner(
+                    processing_inventory_class="known_no_owner",
+                    active_owner_classes=[],
+                    candidates=[
+                        candidate(
+                            "windows_voice_capture_dsp",
+                            convergence,
+                            preservation,
+                        )
+                    ],
+                )
+                self.assertEqual(result["result_class"], expected)
+
+        margin_selected = select_synthetic_aec_owner(
+            processing_inventory_class="known_no_owner",
+            active_owner_classes=[],
+            candidates=[
+                candidate("windows_voice_capture_dsp", 10.0, 1.0),
+                candidate("webrtc_apm_aec3", 9.0, 1.0),
+            ],
+        )
+        self.assertEqual(
+            margin_selected["result_class"], "synthetic_aec_owner_selected"
+        )
+        margin_ambiguous = select_synthetic_aec_owner(
+            processing_inventory_class="known_no_owner",
+            active_owner_classes=[],
+            candidates=[
+                candidate("windows_voice_capture_dsp", 10.0, 1.0),
+                candidate("webrtc_apm_aec3", 9.001, 1.0),
+            ],
+        )
+        self.assertEqual(
+            margin_ambiguous["result_class"], "synthetic_aec_owner_ambiguous"
+        )
+
+        half_step = select_synthetic_aec_owner(
+            processing_inventory_class="known_no_owner",
+            active_owner_classes=[],
+            candidates=[
+                candidate("windows_voice_capture_dsp", 6.2345, 0.9005),
+            ],
+        )
+        self.assertEqual(
+            half_step,
+            {
+                "schema_version": "synthetic_aec_owner_selection.v0",
+                "proof_ceiling": "synthetic_aec_owner_selection_only",
+                "result_class": "synthetic_aec_owner_selected",
+                "processing_inventory_class": "known_no_owner",
+                "candidate_count": 1,
+                "selected_owner_class": "windows_voice_capture_dsp",
+                "selected_echo_convergence_db": 6.235,
+                "selected_near_end_preservation_ratio": 0.901,
+                "exactly_one_aec_owner": True,
+                "observation_only": False,
+                "render_reference_may_create_turn_input": False,
+                "raw_audio_persisted": False,
+                "live_audio_used": False,
+            },
+        )
+
+    def test_synthetic_aec_vector_failures_do_not_echo_private_markers(self) -> None:
+        """Conversion, iteration, and overflow failures expose one fixed class."""
+        import traceback
+
+        private_marker = "private-vector-marker-do-not-echo"
+
+        class PrivateFloat:
+            def __float__(self) -> float:
+                raise ValueError(private_marker)
+
+        class PrivateIterable:
+            def __iter__(self):
+                raise RuntimeError(private_marker)
+
+        invalid_vectors = (
+            [PrivateFloat(), 0.0, 0.0, 0.0],
+            PrivateIterable(),
+            [10**10_000, 0.0, 0.0, 0.0],
+        )
+        for vector in invalid_vectors:
+            with self.subTest(vector_type=type(vector).__name__):
+                try:
+                    evaluate_synthetic_aec_candidate(
+                        owner_class="windows_voice_capture_dsp",
+                        reference_samples=vector,
+                        near_end_samples=[0.2, 0.2, -0.2, -0.2],
+                        microphone_samples=[0.6, -0.2, 0.2, -0.6],
+                        processed_samples=[0.24, 0.16, -0.16, -0.24],
+                    )
+                except AecReferenceError as error:
+                    self.assertEqual(
+                        error.failure_class,
+                        "synthetic_aec_vector_invalid",
+                    )
+                    formatted = traceback.format_exc()
+                    self.assertNotIn(private_marker, str(error))
+                    self.assertNotIn(private_marker, formatted)
+                else:
+                    self.fail("invalid synthetic vector was accepted")
 
     def test_missing_file_fails_with_input_error(self) -> None:
         """Missing files should return an input error."""
