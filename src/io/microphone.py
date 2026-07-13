@@ -9,8 +9,15 @@ import re
 import shutil
 import subprocess
 import wave
+from collections.abc import Mapping
+from typing import Any, Callable
 
 from src.core.pipeline import AudioChunk
+from src.io.aec_reference import (
+    LiveAecCaptureError,
+    LiveAecProcessedCapture,
+    capture_live_aec_processed_pcm,
+)
 from src.io.audio import (
     AudioEnvironmentError,
     AudioInputError,
@@ -18,7 +25,13 @@ from src.io.audio import (
 )
 
 
-SUPPORTED_MICROPHONE_BACKENDS = ("auto", "arecord", "ffmpeg-dshow")
+LIVE_AEC_MICROPHONE_BACKEND = "windows-voice-capture-dsp-aec"
+SUPPORTED_MICROPHONE_BACKENDS = (
+    "auto",
+    "arecord",
+    "ffmpeg-dshow",
+    LIVE_AEC_MICROPHONE_BACKEND,
+)
 RECORDING_MICROPHONE_BACKENDS = ("arecord", "ffmpeg-dshow")
 MICROPHONE_DEVICE_LIST_TIMEOUT_SECONDS = 10
 MICROPHONE_TRIM_TIMEOUT_SECONDS = 30
@@ -369,8 +382,12 @@ def record_microphone_audio(
 ) -> Path:
     """Record a fixed-duration wav file from the microphone."""
     validate_duration(duration)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     resolved_backend = resolve_microphone_backend(backend)
+    if resolved_backend == LIVE_AEC_MICROPHONE_BACKEND:
+        raise AudioInputError(
+            "live AEC capture is in-memory only and cannot use the file recorder"
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     if resolved_backend == "arecord":
         _record_arecord_audio(
             output_path=output_path,
@@ -503,8 +520,35 @@ def capture_microphone_chunk(
     channels: int = 1,
     trim_silence_enabled: bool = True,
     backend: str = "auto",
+    aec_owner_selection: Mapping[str, Any] | None = None,
+    live_aec_deadline_ms: int | None = None,
+    live_aec_capture: Callable[..., LiveAecProcessedCapture] = (
+        capture_live_aec_processed_pcm
+    ),
 ) -> AudioChunk:
     """Capture one microphone chunk and wrap it for the pipeline."""
+    resolved_backend = resolve_microphone_backend(backend)
+    if resolved_backend == LIVE_AEC_MICROPHONE_BACKEND:
+        validate_duration(duration)
+        window_ms = duration * 1000
+        deadline_ms = live_aec_deadline_ms or min(window_ms + 1000, 10_000)
+        try:
+            capture = live_aec_capture(
+                owner_selection=aec_owner_selection,
+                window_ms=window_ms,
+                deadline_ms=deadline_ms,
+            )
+        except LiveAecCaptureError as exc:
+            raise AudioEnvironmentError(exc.failure_class) from None
+        return AudioChunk(
+            path=None,
+            source="microphone",
+            pcm16=capture.pcm16,
+            sample_rate=capture.sample_rate,
+            storage_class=capture.storage_class,
+            turn_input_authority=capture.turn_input_authority,
+            turn_input_authority_class=capture.turn_input_authority_class,
+        )
     audio_path = record_microphone_audio(
         output_path=output_path,
         duration=duration,
@@ -512,7 +556,7 @@ def capture_microphone_chunk(
         sample_rate=sample_rate,
         channels=channels,
         trim_silence_enabled=trim_silence_enabled,
-        backend=backend,
+        backend=resolved_backend,
     )
     return AudioChunk(path=audio_path, source="microphone")
 

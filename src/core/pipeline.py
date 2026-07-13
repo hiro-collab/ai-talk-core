@@ -7,15 +7,47 @@ from pathlib import Path
 import threading
 from typing import Any
 
-from src.io.audio import AudioInputError, load_transcription_model, transcribe_file
+from src.io.audio import (
+    AudioInputError,
+    load_transcription_model,
+    transcribe_file,
+)
 
 
 @dataclass(frozen=True)
 class AudioChunk:
     """A captured audio chunk ready for transcription."""
 
-    path: Path
+    path: Path | None
     source: str
+    pcm16: bytearray | None = None
+    sample_rate: int | None = None
+    storage_class: str = "file"
+    turn_input_authority: bool = True
+    turn_input_authority_class: str = "file_input"
+
+    def __post_init__(self) -> None:
+        has_path = self.path is not None
+        has_pcm = self.pcm16 is not None
+        if has_path == has_pcm:
+            raise AudioInputError("audio chunk must contain exactly one input source")
+        if has_pcm and (
+            self.sample_rate != 16_000
+            or self.storage_class != "in_memory_ephemeral"
+            or (
+                self.turn_input_authority,
+                self.turn_input_authority_class,
+            )
+            != (False, "processed_near_end_observation_only")
+        ):
+            raise AudioInputError("in-memory audio chunk metadata is invalid")
+        if has_path and self.turn_input_authority_class != "file_input":
+            raise AudioInputError("file audio chunk authority metadata is invalid")
+
+    def clear(self) -> None:
+        """Clear any ephemeral PCM owned by this chunk."""
+        if self.pcm16 is not None:
+            self.pcm16[:] = b"\x00" * len(self.pcm16)
 
 
 @dataclass(frozen=True)
@@ -62,6 +94,13 @@ class TranscriptionPipeline:
 
     def transcribe_chunk(self, chunk: AudioChunk, language: str | None = None) -> str:
         """Transcribe a captured audio chunk."""
+        if chunk.pcm16 is not None:
+            chunk.clear()
+            raise AudioInputError(
+                "live AEC in-memory PCM is observation-only"
+            )
+        if chunk.path is None:
+            raise AudioInputError("audio chunk source is unavailable")
         return transcribe_file(audio_path=chunk.path, model=self.model, language=language)
 
     def transcribe_buffer(self, buffer: AudioBuffer, language: str | None = None) -> str:

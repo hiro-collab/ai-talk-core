@@ -75,13 +75,20 @@ from src.io.audio import should_retry_model_load_on_cpu
 from src.io.audio import AudioInputError
 from src.io.audio import AudioEnvironmentError
 from src.io.audio import get_runtime_status
+import src.io.aec_reference as aec_reference_module
 from src.io.aec_reference import (
     AecReferenceError,
+    LiveAecCaptureError,
+    LiveAecProcessedCapture,
+    capture_live_aec_processed_pcm,
     evaluate_synthetic_aec_candidate,
     select_synthetic_aec_owner,
+    validate_live_aec_owner_selection,
 )
 from src.io.microphone import (
+    LIVE_AEC_MICROPHONE_BACKEND,
     MICROPHONE_DEVICE_LIST_TIMEOUT_SECONDS,
+    capture_microphone_chunk,
     get_microphone_runtime_status,
     get_recording_timeout_seconds,
     list_ffmpeg_dshow_audio_devices,
@@ -99,6 +106,7 @@ from src.codex_runner import (
 from src.ollama_runner import build_ollama_command
 from src.core.pipeline import (
     AudioChunk,
+    TranscriptionPipeline,
     TranscriptionResult,
     clear_transcription_pipeline_cache,
     get_cached_transcription_pipeline,
@@ -595,6 +603,550 @@ class SmokeTests(unittest.TestCase):
                     self.assertNotIn(private_marker, formatted)
                 else:
                     self.fail("invalid synthetic vector was accepted")
+
+    def test_live_aec_private_lease_and_pcm_are_in_memory_and_cleared(self) -> None:
+        """The fake live boundary keeps lease data off argv and clears buffers."""
+
+        selection = select_synthetic_aec_owner(
+            processing_inventory_class="known_no_owner",
+            active_owner_classes=[],
+            candidates=[
+                {
+                    "owner_class": "windows_voice_capture_dsp",
+                    "echo_convergence_db": 20.0,
+                    "near_end_preservation_ratio": 1.0,
+                }
+            ],
+        )
+        created_servers = []
+        created_processes = []
+        helper_observation = {"packet_count": 1, "processed_byte_count": 320}
+
+        class FakePrivateStdin:
+            def __init__(self) -> None:
+                self.buffer = bytearray()
+
+            def write(self, value: bytes | bytearray) -> int:
+                self.buffer.extend(value)
+                return len(value)
+
+            def flush(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        class FakeProcess:
+            def __init__(self, command: list[str], **kwargs) -> None:
+                self.command = command
+                self.pid = 4321
+                self._private_stdin = FakePrivateStdin()
+                self.stdin = self._private_stdin
+                self.returncode = None
+                self.lease_keys: set[str] = set()
+                self.private_input_cleared = False
+                created_processes.append(self)
+
+            def communicate(self, timeout: float):
+                del timeout
+                payload = json.loads(bytes(self._private_stdin.buffer).decode("utf-8"))
+                self.lease_keys = set(payload)
+                self._private_stdin.buffer[:] = b"\x00" * len(
+                    self._private_stdin.buffer
+                )
+                self.private_input_cleared = all(
+                    value == 0 for value in self._private_stdin.buffer
+                )
+                self.returncode = 0
+                result = {
+                    "schema_version": "voice_capture_dsp_aec_observation.v0",
+                    "result_class": "processed_near_end_pcm_observed",
+                    "observation": dict(helper_observation),
+                }
+                return json.dumps(result).encode("utf-8"), b""
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.returncode = -1
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            def wait(self, timeout: float):
+                del timeout
+                return self.returncode
+
+        class FakeServer:
+            def __init__(
+                self,
+                pipe_name,
+                nonce,
+                deadline_ms,
+                expires_utc_ticks,
+            ) -> None:
+                self.pipe_name = pipe_name
+                self.nonce = nonce
+                self.deadline_ms = deadline_ms
+                self.expires_utc_ticks = expires_utc_ticks
+                self.expected_pid = None
+                self.close_count = 0
+                self.result_pcm = None
+                created_servers.append(self)
+
+            def start(self, *, expected_client_process_id: int) -> None:
+                self.expected_pid = expected_client_process_id
+
+            def finish(self, *, timeout_seconds: float):
+                del timeout_seconds
+                self.result_pcm = bytearray([1, 2] * 160)
+                return {"pcm16": self.result_pcm, "packet_count": 1}
+
+            def close(self) -> None:
+                self.close_count += 1
+
+        helper_path = Path(__file__)
+        with (
+            mock.patch("src.io.aec_reference._resolve_powershell_executable", return_value="pwsh"),
+            mock.patch("src.io.aec_reference._current_process_creation_utc_ticks", return_value=123),
+            mock.patch("src.io.aec_reference._utc_now_dotnet_ticks", return_value=456),
+        ):
+            capture = capture_live_aec_processed_pcm(
+                owner_selection=selection,
+                window_ms=100,
+                deadline_ms=1000,
+                helper_path=helper_path,
+                popen_factory=FakeProcess,
+                server_factory=FakeServer,
+            )
+
+        process = created_processes[0]
+        server = created_servers[0]
+        command_text = " ".join(process.command)
+        self.assertNotIn("sword-aec-", command_text)
+        self.assertNotIn("0123456789abcdef", command_text)
+        self.assertEqual(
+            process.lease_keys,
+            {
+                "pipe_name",
+                "nonce",
+                "server_process_id",
+                "server_creation_utc_ticks",
+                "expires_utc_ticks",
+                "aec_owner_selection_class",
+                "selected_owner_class",
+            },
+        )
+        self.assertTrue(process.private_input_cleared)
+        self.assertEqual(server.expected_pid, 4321)
+        self.assertGreater(server.expires_utc_ticks, 456)
+        self.assertEqual(server.close_count, 1)
+        self.assertTrue(all(value == 0 for value in server.nonce))
+        self.assertEqual(capture.storage_class, "in_memory_ephemeral")
+        self.assertEqual(capture.packet_count, 1)
+        self.assertEqual(capture.processed_byte_count, 320)
+        self.assertTrue(any(value != 0 for value in capture.pcm16))
+        capture.clear()
+        self.assertTrue(all(value == 0 for value in capture.pcm16))
+
+        helper_observation.update(packet_count=2, processed_byte_count=640)
+        with (
+            mock.patch("src.io.aec_reference._resolve_powershell_executable", return_value="pwsh"),
+            mock.patch("src.io.aec_reference._current_process_creation_utc_ticks", return_value=123),
+            mock.patch("src.io.aec_reference._utc_now_dotnet_ticks", return_value=456),
+        ):
+            with self.assertRaisesRegex(
+                LiveAecCaptureError,
+                "^live_aec_count_mismatch$",
+            ):
+                capture_live_aec_processed_pcm(
+                    owner_selection=selection,
+                    window_ms=100,
+                    deadline_ms=1000,
+                    helper_path=helper_path,
+                    popen_factory=FakeProcess,
+                    server_factory=FakeServer,
+                )
+        failed_server = created_servers[-1]
+        self.assertEqual(failed_server.close_count, 1)
+        self.assertTrue(
+            all(value == 0 for value in failed_server.result_pcm or bytearray())
+        )
+
+        stuck_processes = []
+
+        class StuckProcess(FakeProcess):
+            def __init__(self, command: list[str], **kwargs) -> None:
+                super().__init__(command, **kwargs)
+                self.terminate_count = 0
+                self.kill_count = 0
+                self.wait_count = 0
+                stuck_processes.append(self)
+
+            def communicate(self, timeout: float):
+                raise subprocess.TimeoutExpired(self.command, timeout)
+
+            def poll(self):
+                return None
+
+            def terminate(self) -> None:
+                self.terminate_count += 1
+
+            def kill(self) -> None:
+                self.kill_count += 1
+                self._private_stdin.buffer[:] = b"\x00" * len(
+                    self._private_stdin.buffer
+                )
+
+            def wait(self, timeout: float):
+                self.wait_count += 1
+                raise subprocess.TimeoutExpired(self.command, timeout)
+
+        fixed_nonce = bytes(range(32))
+        fixed_digest = aec_reference_module.hashlib.sha256(fixed_nonce).digest()
+        helper_observation.update(packet_count=1, processed_byte_count=320)
+        with (
+            mock.patch("src.io.aec_reference.secrets.token_bytes", return_value=fixed_nonce),
+            mock.patch("src.io.aec_reference._resolve_powershell_executable", return_value="pwsh"),
+            mock.patch("src.io.aec_reference._current_process_creation_utc_ticks", return_value=123),
+            mock.patch("src.io.aec_reference._utc_now_dotnet_ticks", return_value=456),
+        ):
+            with self.assertRaisesRegex(
+                LiveAecCaptureError,
+                "^live_aec_cleanup_failed$",
+            ):
+                capture_live_aec_processed_pcm(
+                    owner_selection=selection,
+                    window_ms=100,
+                    deadline_ms=1000,
+                    helper_path=helper_path,
+                    popen_factory=StuckProcess,
+                    server_factory=FakeServer,
+                )
+        stuck = stuck_processes[-1]
+        stuck_server = created_servers[-1]
+        self.assertEqual(stuck.terminate_count, 1)
+        self.assertEqual(stuck.kill_count, 1)
+        self.assertEqual(stuck.wait_count, 2)
+        self.assertEqual(stuck_server.close_count, 1)
+        self.assertTrue(all(value == 0 for value in stuck_server.nonce))
+        self.assertTrue(
+            all(value == 0 for value in stuck._private_stdin.buffer)
+        )
+        with aec_reference_module._USED_NONCE_LOCK:
+            self.assertNotIn(
+                fixed_digest,
+                aec_reference_module._ACTIVE_NONCE_DIGESTS,
+            )
+            while fixed_digest in aec_reference_module._USED_NONCE_DIGESTS:
+                aec_reference_module._USED_NONCE_DIGESTS.remove(fixed_digest)
+
+    def test_live_aec_owner_selection_fails_before_transport(self) -> None:
+        """Missing, unknown, or double-owner state cannot launch the helper."""
+
+        invalid = (
+            None,
+            select_synthetic_aec_owner(
+                processing_inventory_class="unknown",
+                active_owner_classes=[],
+                candidates=[],
+            ),
+            select_synthetic_aec_owner(
+                processing_inventory_class="double_owner",
+                active_owner_classes=[
+                    "windows_voice_capture_dsp",
+                    "webrtc_apm_aec3",
+                ],
+                candidates=[],
+            ),
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaises(LiveAecCaptureError) as raised:
+                    validate_live_aec_owner_selection(value)
+                self.assertIn(
+                    raised.exception.failure_class,
+                    {
+                        "live_aec_owner_selection_missing",
+                        "live_aec_owner_selection_invalid",
+                    },
+                )
+
+    def test_live_aec_nonce_replay_registry_rejects_active_and_used_digest(self) -> None:
+        """The Core owner rejects one nonce while active and after retirement."""
+
+        digest = b"bounded-replay-digest-for-test"
+        with aec_reference_module._USED_NONCE_LOCK:
+            aec_reference_module._ACTIVE_NONCE_DIGESTS.discard(digest)
+            while digest in aec_reference_module._USED_NONCE_DIGESTS:
+                aec_reference_module._USED_NONCE_DIGESTS.remove(digest)
+        try:
+            aec_reference_module._register_one_time_nonce(digest)
+            with self.assertRaisesRegex(
+                LiveAecCaptureError,
+                "^live_aec_nonce_reuse_rejected$",
+            ):
+                aec_reference_module._register_one_time_nonce(digest)
+            aec_reference_module._retire_one_time_nonce(digest)
+            with self.assertRaisesRegex(
+                LiveAecCaptureError,
+                "^live_aec_nonce_reuse_rejected$",
+            ):
+                aec_reference_module._register_one_time_nonce(digest)
+        finally:
+            with aec_reference_module._USED_NONCE_LOCK:
+                aec_reference_module._ACTIVE_NONCE_DIGESTS.discard(digest)
+                while digest in aec_reference_module._USED_NONCE_DIGESTS:
+                    aec_reference_module._USED_NONCE_DIGESTS.remove(digest)
+
+    def test_live_aec_source_contract_is_local_private_and_single_instance(self) -> None:
+        """The native pipe shape keeps identity, ACL, and lease data bounded."""
+
+        source = Path(aec_reference_module.__file__).read_text(encoding="utf-8")
+        self.assertIn('"D:P(A;;GA;;;OW)"', source)
+        self.assertIn("_FILE_FLAG_FIRST_PIPE_INSTANCE", source)
+        self.assertIn("_PIPE_REJECT_REMOTE_CLIENTS", source)
+        self.assertIn("GetNamedPipeClientProcessId", source)
+        self.assertIn("hmac.compare_digest", source)
+        self.assertIn("_ACTIVE_NONCE_DIGESTS", source)
+        self.assertGreaterEqual(
+            source.count("_utc_now_dotnet_ticks() >= self._expires_utc_ticks"),
+            2,
+        )
+        command_slice = source[source.index("command = [") : source.index(
+            "process = popen_factory"
+        )]
+        self.assertNotIn("pipe_name", command_slice)
+        self.assertNotIn("nonce", command_slice)
+        self.assertNotIn("server_process_id", command_slice)
+
+    def test_live_aec_reader_handles_fragmentation_and_rejects_bad_frames(self) -> None:
+        """Mutable reader coverage includes split/coalesced and truncated frames."""
+
+        class ChunkReader:
+            def __init__(self, payload: bytes, sizes: list[int]) -> None:
+                self.buffer = bytearray(payload)
+                self.sizes = list(sizes)
+
+            def __call__(self, maximum_bytes: int) -> bytearray | None:
+                if not self.buffer:
+                    return None
+                requested = self.sizes.pop(0) if self.sizes else maximum_bytes
+                count = min(maximum_bytes, requested, len(self.buffer))
+                result = bytearray(self.buffer[:count])
+                self.buffer[:count] = b"\x00" * count
+                del self.buffer[:count]
+                return result
+
+        def exact_reader(reader: ChunkReader):
+            def read_exact(target: bytearray, *, allow_eof: bool = False) -> int:
+                return aec_reference_module._read_exact_from_chunk_reader(
+                    target,
+                    reader,
+                    allow_eof=allow_eof,
+                )
+
+            return read_exact
+
+        nonce = bytes(range(32))
+        nonce_reader = ChunkReader(nonce, [1, 2, 5, 7, 17])
+        nonce_target = bytearray(32)
+        self.assertEqual(
+            aec_reference_module._read_exact_from_chunk_reader(
+                nonce_target,
+                nonce_reader,
+            ),
+            32,
+        )
+        self.assertEqual(bytes(nonce_target), nonce)
+        nonce_target[:] = b"\x00" * len(nonce_target)
+
+        frame = bytes([1, 2] * 160)
+        framed = (320).to_bytes(4, "little", signed=True) + frame
+        coalesced_reader = ChunkReader(framed + framed, [10_000])
+        coalesced = aec_reference_module._read_processed_pcm_frames(
+            exact_reader(coalesced_reader)
+        )
+        self.assertEqual(coalesced["packet_count"], 2)
+        self.assertEqual(len(coalesced["pcm16"]), 640)
+        coalesced["pcm16"][:] = b"\x00" * len(coalesced["pcm16"])
+
+        split_reader = ChunkReader(framed, [1, 1, 2, 3, 5, 7, 11, 293])
+        split = aec_reference_module._read_processed_pcm_frames(
+            exact_reader(split_reader)
+        )
+        self.assertEqual(split["packet_count"], 1)
+        self.assertEqual(len(split["pcm16"]), 320)
+        split["pcm16"][:] = b"\x00" * len(split["pcm16"])
+
+        invalid_payloads = {
+            "truncated_prefix": (320).to_bytes(4, "little")[:2],
+            "truncated_frame": (320).to_bytes(4, "little") + frame[:100],
+            "oversize_length": (322).to_bytes(4, "little") + bytes(322),
+            "late_truncated_frame": framed
+            + (320).to_bytes(4, "little")
+            + frame[:100],
+        }
+        original_clear = aec_reference_module._clear_bytearray
+        for case_name, payload in invalid_payloads.items():
+            cleared_lengths: list[int] = []
+
+            def clearing_spy(value: bytearray) -> None:
+                length = len(value)
+                original_clear(value)
+                if all(item == 0 for item in value):
+                    cleared_lengths.append(length)
+
+            reader = ChunkReader(payload, [1, 2, 7, 13, 301, 10_000])
+            with self.subTest(case=case_name), mock.patch(
+                "src.io.aec_reference._clear_bytearray",
+                side_effect=clearing_spy,
+            ):
+                with self.assertRaisesRegex(
+                    LiveAecCaptureError,
+                    "^live_aec_processed_packet_invalid$",
+                ):
+                    aec_reference_module._read_processed_pcm_frames(
+                        exact_reader(reader)
+                    )
+                self.assertTrue(cleared_lengths)
+                if case_name == "late_truncated_frame":
+                    self.assertGreaterEqual(cleared_lengths.count(320), 2)
+
+    def test_live_aec_owned_process_cleanup_converges_or_fails_closed(self) -> None:
+        """Only the owned helper is terminated, then killed if it cannot converge."""
+
+        class FakeProcess:
+            def __init__(self, fail_waits: int) -> None:
+                self.fail_waits = fail_waits
+                self.terminate_count = 0
+                self.kill_count = 0
+                self.wait_count = 0
+
+            def terminate(self) -> None:
+                self.terminate_count += 1
+
+            def kill(self) -> None:
+                self.kill_count += 1
+
+            def wait(self, timeout: float) -> int:
+                self.assert_timeout = timeout
+                self.wait_count += 1
+                if self.wait_count <= self.fail_waits:
+                    raise subprocess.TimeoutExpired("fixed", timeout)
+                return 0
+
+        graceful = FakeProcess(fail_waits=0)
+        aec_reference_module._stop_owned_process(graceful)
+        self.assertEqual(graceful.terminate_count, 1)
+        self.assertEqual(graceful.kill_count, 0)
+        self.assertEqual(graceful.wait_count, 1)
+
+        escalated = FakeProcess(fail_waits=1)
+        aec_reference_module._stop_owned_process(escalated)
+        self.assertEqual(escalated.terminate_count, 1)
+        self.assertEqual(escalated.kill_count, 1)
+        self.assertEqual(escalated.wait_count, 2)
+
+        blocked = FakeProcess(fail_waits=2)
+        with self.assertRaisesRegex(
+            LiveAecCaptureError,
+            "^live_aec_process_cleanup_failed$",
+        ):
+            aec_reference_module._stop_owned_process(blocked)
+
+    def test_live_aec_microphone_adapter_is_explicit_and_pathless(self) -> None:
+        """The live adapter returns one pathless chunk and never changes auto."""
+
+        selection = {
+            "result_class": "synthetic_aec_owner_selected",
+            "selected_owner_class": "windows_voice_capture_dsp",
+            "exactly_one_aec_owner": True,
+            "observation_only": False,
+            "raw_audio_persisted": False,
+            "live_audio_used": False,
+        }
+        captured = {}
+
+        def fake_capture(**kwargs):
+            captured.update(kwargs)
+            return LiveAecProcessedCapture(
+                pcm16=bytearray([1, 2] * 160),
+                packet_count=1,
+            )
+
+        chunk = capture_microphone_chunk(
+            output_path=Path("private-should-not-exist.wav"),
+            duration=1,
+            backend=LIVE_AEC_MICROPHONE_BACKEND,
+            aec_owner_selection=selection,
+            live_aec_capture=fake_capture,
+        )
+        self.assertIsNone(chunk.path)
+        self.assertEqual(chunk.storage_class, "in_memory_ephemeral")
+        self.assertEqual(chunk.sample_rate, 16_000)
+        self.assertFalse(chunk.turn_input_authority)
+        self.assertEqual(
+            chunk.turn_input_authority_class,
+            "processed_near_end_observation_only",
+        )
+        self.assertIs(captured["owner_selection"], selection)
+        self.assertEqual(captured["window_ms"], 1000)
+        self.assertEqual(captured["deadline_ms"], 2000)
+        self.assertNotEqual(resolve_microphone_backend("auto"), LIVE_AEC_MICROPHONE_BACKEND)
+        with self.assertRaisesRegex(AudioInputError, "in-memory only"):
+            record_microphone_audio(
+                output_path=Path("private-should-not-exist.wav"),
+                duration=1,
+                backend=LIVE_AEC_MICROPHONE_BACKEND,
+            )
+        with self.assertRaisesRegex(
+            AudioEnvironmentError,
+            "^live_aec_owner_selection_missing$",
+        ):
+            capture_microphone_chunk(
+                output_path=Path("private-should-not-exist.wav"),
+                duration=1,
+                backend=LIVE_AEC_MICROPHONE_BACKEND,
+            )
+
+        pipeline = TranscriptionPipeline.__new__(TranscriptionPipeline)
+        model = mock.Mock()
+        model.transcribe.return_value = {"text": "accepted"}
+        pipeline.model = model
+        with self.assertRaisesRegex(AudioInputError, "observation-only"):
+            pipeline.transcribe_chunk(chunk, language="ja")
+        self.assertTrue(all(value == 0 for value in chunk.pcm16 or bytearray()))
+        self.assertEqual(model.transcribe.call_count, 0)
+
+        with self.assertRaisesRegex(AudioInputError, "metadata is invalid"):
+            AudioChunk(
+                path=None,
+                source="microphone",
+                pcm16=bytearray([1, 2] * 160),
+                sample_rate=16_000,
+                storage_class="in_memory_ephemeral",
+            )
+
+
+    def test_live_aec_cli_without_private_selection_fails_before_capture(self) -> None:
+        """CLI selection cannot manufacture or expose the private owner lease."""
+
+        result = run_cli(
+            "--mic",
+            "--duration",
+            "1",
+            "--mic-backend",
+            LIVE_AEC_MICROPHONE_BACKEND,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(
+            result.stdout.strip(),
+            "Environment error: live_aec_owner_selection_missing",
+        )
+        self.assertEqual(result.stderr, "")
+        self.assertNotIn("sword-aec-", result.stdout)
 
     def test_missing_file_fails_with_input_error(self) -> None:
         """Missing files should return an input error."""

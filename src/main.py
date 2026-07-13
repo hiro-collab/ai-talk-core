@@ -39,7 +39,6 @@ from src.io.microphone import (
     capture_microphone_chunk,
     get_temp_recording_path,
     has_detectable_speech,
-    record_microphone_audio,
     validate_vad_aggressiveness,
 )
 
@@ -168,6 +167,7 @@ def run_mic_loop(
     final_stable_seconds: int,
     input_enabled: bool = True,
     input_gate_reason: str = "manual",
+    aec_owner_selection: dict[str, object] | None = None,
 ) -> int:
     """Record and transcribe microphone chunks until interrupted."""
     input_gate = InputGate(
@@ -230,7 +230,13 @@ def run_mic_loop(
                 device=mic_device,
                 backend=mic_backend,
                 trim_silence_enabled=trim_silence_enabled,
+                aec_owner_selection=aec_owner_selection,
             )
+            if not chunk.turn_input_authority:
+                chunk.clear()
+                raise AudioInputError(
+                    "live AEC observation lacks genuine-user TurnInput authority"
+                )
             active_session = get_session()
             result = active_session.process_chunk(
                 chunk,
@@ -644,26 +650,35 @@ def main() -> int:
                 input_enabled=not args.input_disabled,
                 input_gate_reason=args.input_gate_reason,
             )
+        chunk: AudioChunk
         if args.mic:
             if args.audio_file is not None:
                 raise AudioInputError("audio_file cannot be used together with --mic")
-            audio_path = record_microphone_audio(
+            chunk = capture_microphone_chunk(
                 output_path=get_temp_recording_path(),
                 duration=args.duration,
                 device=args.mic_device,
                 backend=args.mic_backend,
                 trim_silence_enabled=not args.no_trim_silence,
             )
+            if not chunk.turn_input_authority:
+                chunk.clear()
+                raise AudioInputError(
+                    "live AEC observation lacks genuine-user TurnInput authority"
+                )
+            record_payload: dict[str, object] = {
+                "transport": "cli_microphone",
+                "duration_seconds": args.duration,
+                "backend": args.mic_backend,
+                "storage_class": chunk.storage_class,
+            }
+            if chunk.path is not None:
+                record_payload["filename"] = chunk.path.name
             emit_event(
                 "record_stop",
                 turn_id=turn_id,
                 source="cli",
-                payload={
-                    "transport": "cli_microphone",
-                    "filename": audio_path.name,
-                    "duration_seconds": args.duration,
-                    "backend": args.mic_backend,
-                },
+                payload=record_payload,
             )
         else:
             if not args.audio_file:
@@ -672,27 +687,25 @@ def main() -> int:
                 )
             audio_path = Path(args.audio_file).expanduser().resolve()
             validate_audio_file(audio_path)
+            chunk = AudioChunk(path=audio_path, source="file")
         source = "microphone" if args.mic else "file"
+        stt_payload: dict[str, object] = {
+            "model": args.model,
+            "language": args.language or "",
+            "source": source,
+            "storage_class": chunk.storage_class,
+        }
+        if chunk.path is not None:
+            stt_payload["filename"] = chunk.path.name
         emit_event(
             "stt_start",
             turn_id=turn_id,
             source="cli",
-            payload={
-                "model": args.model,
-                "language": args.language or "",
-                "source": source,
-                "filename": audio_path.name,
-            },
+            payload=stt_payload,
         )
         try:
             pipeline = TranscriptionPipeline(model_name=args.model)
-            text = pipeline.transcribe_chunk(
-                AudioChunk(
-                    path=audio_path,
-                    source=source,
-                ),
-                language=args.language,
-            )
+            text = pipeline.transcribe_chunk(chunk, language=args.language)
         except Exception as exc:
             emit_event(
                 "stt_done",

@@ -3,7 +3,19 @@
 from __future__ import annotations
 
 import math
+import ctypes
+import hashlib
+import hmac
+import json
+import os
+import platform
+import secrets
+import subprocess
+import threading
+import time
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -23,6 +35,19 @@ MIN_SELECTION_MARGIN_DB = 1.0
 _MIN_VECTOR_LENGTH = 4
 _MAX_VECTOR_LENGTH = 48_000
 _EPSILON = 1e-9
+LIVE_AEC_OWNER_CLASS = "windows_voice_capture_dsp"
+LIVE_AEC_SELECTION_CLASS = "synthetic_aec_owner_selected"
+LIVE_AEC_FRAME_BYTES = 320
+LIVE_AEC_SAMPLE_RATE = 16_000
+LIVE_AEC_MAX_CAPTURE_BYTES = LIVE_AEC_SAMPLE_RATE * 2 * 5
+_LIVE_AEC_PIPE_PREFIX = "sword-aec-"
+_LIVE_AEC_ACK = b"\xa1"
+_LIVE_AEC_MAX_LEASE_SECONDS = 15
+_DOTNET_FILETIME_OFFSET_TICKS = 504_911_232_000_000_000
+_USED_NONCE_DIGEST_LIMIT = 1024
+_USED_NONCE_DIGESTS: list[bytes] = []
+_ACTIVE_NONCE_DIGESTS: set[bytes] = set()
+_USED_NONCE_LOCK = threading.Lock()
 
 
 class AecReferenceError(ValueError):
@@ -31,6 +56,643 @@ class AecReferenceError(ValueError):
     def __init__(self, failure_class: str) -> None:
         super().__init__(failure_class)
         self.failure_class = failure_class
+
+
+class LiveAecCaptureError(RuntimeError):
+    """Expose only a fixed class for the live AEC transport boundary."""
+
+    def __init__(self, failure_class: str) -> None:
+        super().__init__(failure_class)
+        self.failure_class = failure_class
+
+
+@dataclass
+class LiveAecProcessedCapture:
+    """Hold processed near-end PCM only until its in-memory consumer clears it."""
+
+    pcm16: bytearray
+    packet_count: int
+    sample_rate: int = LIVE_AEC_SAMPLE_RATE
+    storage_class: str = "in_memory_ephemeral"
+    turn_input_authority: bool = False
+    turn_input_authority_class: str = "processed_near_end_observation_only"
+
+    @property
+    def processed_byte_count(self) -> int:
+        return len(self.pcm16)
+
+    def clear(self) -> None:
+        _clear_bytearray(self.pcm16)
+
+
+def validate_live_aec_owner_selection(
+    selection: Mapping[str, Any] | None,
+) -> dict[str, object]:
+    """Require the exact adopted Phase 2 single-owner selection."""
+
+    if not isinstance(selection, Mapping):
+        raise LiveAecCaptureError("live_aec_owner_selection_missing")
+    try:
+        result_class = selection.get("result_class")
+        selected_owner = selection.get("selected_owner_class")
+        exactly_one = selection.get("exactly_one_aec_owner")
+        observation_only = selection.get("observation_only")
+        raw_audio_persisted = selection.get("raw_audio_persisted")
+        live_audio_used = selection.get("live_audio_used")
+    except Exception:
+        raise LiveAecCaptureError("live_aec_owner_selection_invalid") from None
+    if (
+        result_class != LIVE_AEC_SELECTION_CLASS
+        or selected_owner != LIVE_AEC_OWNER_CLASS
+        or exactly_one is not True
+        or observation_only is not False
+        or raw_audio_persisted is not False
+        or live_audio_used is not False
+    ):
+        raise LiveAecCaptureError("live_aec_owner_selection_invalid")
+    return {
+        "result_class": LIVE_AEC_SELECTION_CLASS,
+        "selected_owner_class": LIVE_AEC_OWNER_CLASS,
+    }
+
+
+def capture_live_aec_processed_pcm(
+    *,
+    owner_selection: Mapping[str, Any] | None,
+    window_ms: int,
+    deadline_ms: int,
+    helper_path: Path | None = None,
+    popen_factory: Any = subprocess.Popen,
+    server_factory: Any = None,
+) -> LiveAecProcessedCapture:
+    """Capture one bounded processed-PCM window through a private pipe lease."""
+
+    validated = validate_live_aec_owner_selection(owner_selection)
+    if window_ms < 100 or window_ms > 5000:
+        raise LiveAecCaptureError("live_aec_bounds_invalid")
+    if deadline_ms < window_ms + 200 or deadline_ms > 10_000:
+        raise LiveAecCaptureError("live_aec_bounds_invalid")
+    resolved_helper = helper_path or _default_live_aec_helper_path()
+    if not resolved_helper.is_file():
+        raise LiveAecCaptureError("live_aec_helper_unavailable")
+
+    nonce = bytearray(secrets.token_bytes(32))
+    nonce_digest = hashlib.sha256(nonce).digest()
+    _register_one_time_nonce(nonce_digest)
+    pipe_name = _LIVE_AEC_PIPE_PREFIX + secrets.token_hex(16)
+    server = None
+    process = None
+    lease_bytes = bytearray()
+    stdout_bytes = bytearray()
+    stderr_bytes = bytearray()
+    capture: LiveAecProcessedCapture | None = None
+    server_pcm: bytearray | None = None
+    cleanup_failed = False
+    try:
+        server_pid = os.getpid()
+        server_creation_ticks = _current_process_creation_utc_ticks()
+        expires_ticks = _utc_now_dotnet_ticks() + min(
+            deadline_ms + 1000,
+            _LIVE_AEC_MAX_LEASE_SECONDS * 1000,
+        ) * 10_000
+        server = (
+            server_factory(pipe_name, nonce, deadline_ms, expires_ticks)
+            if server_factory is not None
+            else _WindowsProcessedPcmPipeServer(
+                pipe_name,
+                nonce,
+                deadline_ms,
+                expires_ticks,
+            )
+        )
+        lease_bytes.extend(
+            _encode_private_lease_packet(
+                pipe_name=pipe_name,
+                nonce=nonce,
+                server_process_id=server_pid,
+                server_creation_utc_ticks=server_creation_ticks,
+                expires_utc_ticks=expires_ticks,
+                selection=validated,
+            )
+        )
+        command = [
+            _resolve_powershell_executable(),
+            "-NoProfile",
+            "-File",
+            str(resolved_helper),
+            "-Mode",
+            "live_source",
+            "-WindowMs",
+            str(window_ms),
+            "-DeadlineMs",
+            str(deadline_ms),
+            "-Compact",
+        ]
+        process = popen_factory(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if process.stdin is None:
+            raise LiveAecCaptureError("live_aec_private_input_unavailable")
+        process.stdin.write(lease_bytes)
+        process.stdin.write(b"\n")
+        process.stdin.flush()
+        process.stdin.close()
+        process.stdin = None
+        server.start(expected_client_process_id=process.pid)
+        timeout_seconds = deadline_ms / 1000 + 1.0
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            raise LiveAecCaptureError("live_aec_deadline_exceeded") from None
+        stdout_bytes.extend(stdout or b"")
+        stderr_bytes.extend(stderr or b"")
+        server_result = server.finish(timeout_seconds=1.0)
+        server_pcm = server_result.get("pcm16")
+        if not isinstance(server_pcm, bytearray):
+            raise LiveAecCaptureError("live_aec_pipe_result_invalid")
+        raw_packet_count = server_result.get("packet_count")
+        if (
+            isinstance(raw_packet_count, bool)
+            or not isinstance(raw_packet_count, int)
+            or raw_packet_count < 0
+            or len(server_pcm) != raw_packet_count * LIVE_AEC_FRAME_BYTES
+        ):
+            raise LiveAecCaptureError("live_aec_pipe_result_invalid")
+        if process.returncode != 0:
+            raise LiveAecCaptureError("live_aec_helper_failed")
+        helper_result = _parse_helper_class_only_result(stdout_bytes)
+        if helper_result.get("result_class") not in {
+            "processed_near_end_pcm_observed",
+            "processed_near_end_silence_observed",
+        }:
+            raise LiveAecCaptureError("live_aec_helper_failed")
+        pcm16 = server_pcm
+        packet_count = raw_packet_count
+        helper_packet_count = helper_result["observation"]["packet_count"]
+        helper_byte_count = helper_result["observation"]["processed_byte_count"]
+        if helper_packet_count != packet_count:
+            _clear_bytearray(pcm16)
+            raise LiveAecCaptureError("live_aec_count_mismatch")
+        if helper_byte_count != len(pcm16):
+            _clear_bytearray(pcm16)
+            raise LiveAecCaptureError("live_aec_count_mismatch")
+        capture = LiveAecProcessedCapture(
+            pcm16=pcm16,
+            packet_count=packet_count,
+        )
+        server_pcm = None
+        return capture
+    except LiveAecCaptureError:
+        raise
+    except Exception:
+        raise LiveAecCaptureError("live_aec_capture_failed") from None
+    finally:
+        try:
+            if process is not None and process.poll() is None:
+                _stop_owned_process(process)
+        except Exception:
+            cleanup_failed = True
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                cleanup_failed = True
+        _clear_bytearray(nonce)
+        _clear_bytearray(lease_bytes)
+        _clear_bytearray(stdout_bytes)
+        _clear_bytearray(stderr_bytes)
+        if server_pcm is not None:
+            _clear_bytearray(server_pcm)
+        try:
+            _retire_one_time_nonce(nonce_digest)
+        except Exception:
+            cleanup_failed = True
+        if cleanup_failed:
+            if capture is not None:
+                capture.clear()
+            raise LiveAecCaptureError("live_aec_cleanup_failed")
+
+
+def _default_live_aec_helper_path() -> Path:
+    return (
+        Path(__file__).resolve().parents[5]
+        / "runtime"
+        / "audio-awareness"
+        / "windows"
+        / "invoke-voice-capture-dsp-aec.ps1"
+    )
+
+
+def _resolve_powershell_executable() -> str:
+    import shutil
+
+    executable = shutil.which("pwsh")
+    if executable is None:
+        raise LiveAecCaptureError("live_aec_powershell_unavailable")
+    return executable
+
+
+def _encode_private_lease_packet(
+    *,
+    pipe_name: str,
+    nonce: bytearray,
+    server_process_id: int,
+    server_creation_utc_ticks: int,
+    expires_utc_ticks: int,
+    selection: Mapping[str, object],
+) -> bytes:
+    packet = {
+        "pipe_name": pipe_name,
+        "nonce": bytes(nonce).hex(),
+        "server_process_id": server_process_id,
+        "server_creation_utc_ticks": server_creation_utc_ticks,
+        "expires_utc_ticks": expires_utc_ticks,
+        "aec_owner_selection_class": selection["result_class"],
+        "selected_owner_class": selection["selected_owner_class"],
+    }
+    return json.dumps(packet, separators=(",", ":")).encode("utf-8")
+
+
+def _parse_helper_class_only_result(raw: bytearray) -> dict[str, Any]:
+    try:
+        payload = json.loads(bytes(raw).decode("utf-8"))
+    except Exception:
+        raise LiveAecCaptureError("live_aec_helper_result_invalid") from None
+    if not isinstance(payload, dict):
+        raise LiveAecCaptureError("live_aec_helper_result_invalid")
+    if payload.get("schema_version") != "voice_capture_dsp_aec_observation.v0":
+        raise LiveAecCaptureError("live_aec_helper_result_invalid")
+    observation = payload.get("observation")
+    if not isinstance(observation, dict):
+        raise LiveAecCaptureError("live_aec_helper_result_invalid")
+    packet_count = observation.get("packet_count")
+    byte_count = observation.get("processed_byte_count")
+    if (
+        isinstance(packet_count, bool)
+        or not isinstance(packet_count, int)
+        or packet_count < 0
+        or isinstance(byte_count, bool)
+        or not isinstance(byte_count, int)
+        or byte_count < 0
+        or byte_count != packet_count * LIVE_AEC_FRAME_BYTES
+    ):
+        raise LiveAecCaptureError("live_aec_helper_result_invalid")
+    return payload
+
+
+def _register_one_time_nonce(digest: bytes) -> None:
+    with _USED_NONCE_LOCK:
+        if digest in _USED_NONCE_DIGESTS or digest in _ACTIVE_NONCE_DIGESTS:
+            raise LiveAecCaptureError("live_aec_nonce_reuse_rejected")
+        _ACTIVE_NONCE_DIGESTS.add(digest)
+
+
+def _retire_one_time_nonce(digest: bytes) -> None:
+    with _USED_NONCE_LOCK:
+        _ACTIVE_NONCE_DIGESTS.discard(digest)
+        if digest not in _USED_NONCE_DIGESTS:
+            _USED_NONCE_DIGESTS.append(digest)
+        if len(_USED_NONCE_DIGESTS) > _USED_NONCE_DIGEST_LIMIT:
+            del _USED_NONCE_DIGESTS[:-_USED_NONCE_DIGEST_LIMIT]
+
+
+def _clear_bytearray(value: bytearray) -> None:
+    value[:] = b"\x00" * len(value)
+
+
+def _utc_now_dotnet_ticks() -> int:
+    return time.time_ns() // 100 + 621_355_968_000_000_000
+
+
+def _current_process_creation_utc_ticks() -> int:
+    if platform.system() != "Windows":
+        raise LiveAecCaptureError("live_aec_platform_unsupported")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.GetProcessTimes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    kernel32.GetProcessTimes.restype = ctypes.c_int
+    creation = ctypes.c_ulonglong()
+    exit_time = ctypes.c_ulonglong()
+    kernel = ctypes.c_ulonglong()
+    user = ctypes.c_ulonglong()
+    if not kernel32.GetProcessTimes(
+        kernel32.GetCurrentProcess(),
+        ctypes.byref(creation),
+        ctypes.byref(exit_time),
+        ctypes.byref(kernel),
+        ctypes.byref(user),
+    ):
+        raise LiveAecCaptureError("live_aec_server_identity_unavailable")
+    return int(creation.value) + _DOTNET_FILETIME_OFFSET_TICKS
+
+
+def _stop_owned_process(process: Any) -> None:
+    try:
+        process.terminate()
+        process.wait(timeout=1.0)
+    except Exception:
+        try:
+            process.kill()
+            process.wait(timeout=1.0)
+        except Exception:
+            raise LiveAecCaptureError("live_aec_process_cleanup_failed") from None
+
+
+def _read_exact_from_chunk_reader(
+    target: bytearray,
+    read_chunk: Any,
+    *,
+    allow_eof: bool = False,
+) -> int:
+    """Fill one mutable target across fragmented byte-mode reads."""
+
+    total = 0
+    while total < len(target):
+        chunk = read_chunk(len(target) - total)
+        if chunk is None:
+            if allow_eof:
+                return total
+            raise LiveAecCaptureError("live_aec_pipe_read_failed")
+        if (
+            not isinstance(chunk, bytearray)
+            or len(chunk) == 0
+            or len(chunk) > len(target) - total
+        ):
+            if isinstance(chunk, bytearray):
+                _clear_bytearray(chunk)
+            raise LiveAecCaptureError("live_aec_pipe_read_failed")
+        try:
+            target[total : total + len(chunk)] = chunk
+            total += len(chunk)
+        finally:
+            _clear_bytearray(chunk)
+    return total
+
+
+def _read_processed_pcm_frames(read_exact: Any) -> dict[str, Any]:
+    """Read exact framed PCM while clearing all partial state on failure."""
+
+    pcm = bytearray()
+    packet_count = 0
+    try:
+        while True:
+            prefix = bytearray(4)
+            try:
+                received = read_exact(prefix, allow_eof=True)
+                if received == 0:
+                    break
+                if received != 4:
+                    raise LiveAecCaptureError(
+                        "live_aec_processed_packet_invalid"
+                    )
+                frame_length = int.from_bytes(prefix, "little", signed=True)
+                if frame_length != LIVE_AEC_FRAME_BYTES:
+                    raise LiveAecCaptureError(
+                        "live_aec_processed_packet_invalid"
+                    )
+                frame = bytearray(frame_length)
+                try:
+                    try:
+                        read_exact(frame)
+                    except LiveAecCaptureError:
+                        raise LiveAecCaptureError(
+                            "live_aec_processed_packet_invalid"
+                        ) from None
+                    if len(pcm) + len(frame) > LIVE_AEC_MAX_CAPTURE_BYTES:
+                        raise LiveAecCaptureError(
+                            "live_aec_capture_bounds_exceeded"
+                        )
+                    pcm.extend(frame)
+                    packet_count += 1
+                finally:
+                    _clear_bytearray(frame)
+            finally:
+                _clear_bytearray(prefix)
+        return {"pcm16": pcm, "packet_count": packet_count}
+    except Exception:
+        _clear_bytearray(pcm)
+        raise
+
+
+class _WindowsProcessedPcmPipeServer:
+    """One-shot current-user local pipe server for processed PCM only."""
+
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    _PIPE_ACCESS_DUPLEX = 0x00000003
+    _FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
+    _PIPE_TYPE_BYTE = 0x00000000
+    _PIPE_READMODE_BYTE = 0x00000000
+    _PIPE_WAIT = 0x00000000
+    _PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
+    _ERROR_PIPE_CONNECTED = 535
+    _ERROR_BROKEN_PIPE = 109
+    _ERROR_NO_DATA = 232
+
+    class _SecurityAttributes(ctypes.Structure):
+        _fields_ = [
+            ("nLength", ctypes.c_uint32),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", ctypes.c_int),
+        ]
+
+    def __init__(
+        self,
+        pipe_name: str,
+        nonce: bytearray,
+        deadline_ms: int,
+        expires_utc_ticks: int,
+    ) -> None:
+        if platform.system() != "Windows":
+            raise LiveAecCaptureError("live_aec_platform_unsupported")
+        self._pipe_name = pipe_name
+        self._nonce = nonce
+        self._deadline_ms = deadline_ms
+        self._expires_utc_ticks = expires_utc_ticks
+        self._handle: int | None = None
+        self._security_descriptor = ctypes.c_void_p()
+        self._thread: threading.Thread | None = None
+        self._expected_client_pid = 0
+        self._result: dict[str, Any] | None = None
+        self._failure: str | None = None
+        self._create()
+
+    def _create(self) -> None:
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+        ]
+        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = (
+            ctypes.c_int
+        )
+        if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            "D:P(A;;GA;;;OW)",
+            1,
+            ctypes.byref(self._security_descriptor),
+            None,
+        ):
+            raise LiveAecCaptureError("live_aec_pipe_acl_failed")
+        attributes = self._SecurityAttributes(
+            ctypes.sizeof(self._SecurityAttributes),
+            self._security_descriptor,
+            0,
+        )
+        kernel32.CreateNamedPipeW.restype = ctypes.c_void_p
+        kernel32.CreateNamedPipeW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.POINTER(self._SecurityAttributes),
+        ]
+        handle = kernel32.CreateNamedPipeW(
+            "\\\\.\\pipe\\" + self._pipe_name,
+            self._PIPE_ACCESS_DUPLEX | self._FILE_FLAG_FIRST_PIPE_INSTANCE,
+            self._PIPE_TYPE_BYTE
+            | self._PIPE_READMODE_BYTE
+            | self._PIPE_WAIT
+            | self._PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            LIVE_AEC_FRAME_BYTES + 4,
+            LIVE_AEC_FRAME_BYTES + 4,
+            self._deadline_ms,
+            ctypes.byref(attributes),
+        )
+        if handle == self._INVALID_HANDLE_VALUE:
+            self.close()
+            raise LiveAecCaptureError("live_aec_pipe_create_failed")
+        self._handle = int(handle)
+
+    def start(self, *, expected_client_process_id: int) -> None:
+        self._expected_client_pid = expected_client_process_id
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def finish(self, *, timeout_seconds: float) -> dict[str, Any]:
+        if self._thread is None:
+            raise LiveAecCaptureError("live_aec_pipe_not_started")
+        self._thread.join(timeout_seconds)
+        if self._thread.is_alive():
+            raise LiveAecCaptureError("live_aec_pipe_deadline_exceeded")
+        if self._failure is not None:
+            raise LiveAecCaptureError(self._failure)
+        if self._result is None:
+            raise LiveAecCaptureError("live_aec_pipe_result_missing")
+        return self._result
+
+    def _run(self) -> None:
+        pcm = bytearray()
+        received_nonce = bytearray(32)
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            connected = kernel32.ConnectNamedPipe(
+                ctypes.c_void_p(self._handle),
+                None,
+            )
+            if not connected and ctypes.get_last_error() != self._ERROR_PIPE_CONNECTED:
+                raise LiveAecCaptureError("live_aec_pipe_connect_failed")
+            client_pid = ctypes.c_uint32()
+            if not kernel32.GetNamedPipeClientProcessId(
+                ctypes.c_void_p(self._handle),
+                ctypes.byref(client_pid),
+            ) or int(client_pid.value) != self._expected_client_pid:
+                raise LiveAecCaptureError("live_aec_pipe_client_identity_mismatch")
+            if _utc_now_dotnet_ticks() >= self._expires_utc_ticks:
+                raise LiveAecCaptureError("live_aec_pipe_lease_expired")
+            self._read_exact(received_nonce)
+            if not hmac.compare_digest(received_nonce, self._nonce):
+                raise LiveAecCaptureError("live_aec_pipe_nonce_mismatch")
+            if _utc_now_dotnet_ticks() >= self._expires_utc_ticks:
+                raise LiveAecCaptureError("live_aec_pipe_lease_expired")
+            self._write_all(_LIVE_AEC_ACK)
+            self._result = _read_processed_pcm_frames(self._read_exact)
+        except LiveAecCaptureError as exc:
+            _clear_bytearray(pcm)
+            self._failure = exc.failure_class
+        except Exception:
+            _clear_bytearray(pcm)
+            self._failure = "live_aec_pipe_failed"
+        finally:
+            _clear_bytearray(received_nonce)
+
+    def _read_exact(self, target: bytearray, *, allow_eof: bool = False) -> int:
+        return _read_exact_from_chunk_reader(
+            target,
+            self._read_native_chunk,
+            allow_eof=allow_eof,
+        )
+
+    def _read_native_chunk(self, maximum_bytes: int) -> bytearray | None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        target = bytearray(maximum_bytes)
+        read = ctypes.c_uint32()
+        try:
+            view = (ctypes.c_ubyte * maximum_bytes).from_buffer(target)
+            ok = kernel32.ReadFile(
+                ctypes.c_void_p(self._handle),
+                view,
+                len(view),
+                ctypes.byref(read),
+                None,
+            )
+            if not ok:
+                error = ctypes.get_last_error()
+                if error in {self._ERROR_BROKEN_PIPE, self._ERROR_NO_DATA}:
+                    return None
+                raise LiveAecCaptureError("live_aec_pipe_read_failed")
+            if read.value == 0:
+                return None
+            result = bytearray(target[: int(read.value)])
+            return result
+        finally:
+            _clear_bytearray(target)
+
+    def _write_all(self, value: bytes) -> None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        written = ctypes.c_uint32()
+        buffer = ctypes.create_string_buffer(value)
+        if not kernel32.WriteFile(
+            ctypes.c_void_p(self._handle),
+            buffer,
+            len(value),
+            ctypes.byref(written),
+            None,
+        ) or written.value != len(value):
+            raise LiveAecCaptureError("live_aec_pipe_ack_failed")
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(
+                ctypes.c_void_p(handle)
+            )
+        if self._security_descriptor:
+            ctypes.WinDLL("kernel32", use_last_error=True).LocalFree(
+                self._security_descriptor
+            )
+            self._security_descriptor = ctypes.c_void_p()
+        if (
+            self._thread is not None
+            and self._thread is not threading.current_thread()
+        ):
+            self._thread.join(1.0)
+            if self._thread.is_alive():
+                raise LiveAecCaptureError("live_aec_pipe_cleanup_failed")
 
 
 def evaluate_synthetic_aec_candidate(
