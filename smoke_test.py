@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import io
 import contextlib
+import copy
 import json
 import os
 from pathlib import Path
+import pickle
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from unittest import mock
@@ -43,6 +46,7 @@ from src.core.input_gate import (
     InputGate,
     InputGateError,
     InputGateEvent,
+    UserSpeechCandidateEvidence,
     parse_input_gate_payload,
 )
 from src.core.events import (
@@ -74,6 +78,7 @@ from src.main import (
 from src.io.audio import should_retry_model_load_on_cpu
 from src.io.audio import AudioInputError
 from src.io.audio import AudioEnvironmentError
+from src.io.audio import AudioTranscriptionError
 from src.io.audio import get_runtime_status
 import src.io.aec_reference as aec_reference_module
 from src.io.aec_reference import (
@@ -125,6 +130,7 @@ from src.web.app import (
     build_runtime_status_payload,
     build_input_gate_response,
     create_app,
+    format_sse_event,
     get_recording_chunk_dir,
     parse_bearer_token,
     prune_recording_chunk_cache,
@@ -173,6 +179,115 @@ def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
     )
+
+
+SYSTEM_SPEECH_SESSION_ID = (
+    "system-speech-session:sss_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+)
+PLAYBACK_EVENT_REF = "playback-event:pe_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+SELF_OUTPUT_OBSERVATION_REF = (
+    "self-output-observation:aso_cccccccccccccccccccccccccccccccc"
+)
+
+
+def build_system_speech_lifecycle(
+    state: str = "released",
+    *,
+    generation: int = 7,
+    session_id: str = SYSTEM_SPEECH_SESSION_ID,
+    playback_ref: str = PLAYBACK_EVENT_REF,
+) -> dict[str, object]:
+    if state == "handoff_accepted":
+        completion, suppression, cooldown = "pending", "active", "clear"
+    elif state == "cooldown":
+        completion, suppression, cooldown = "callback_observed", "active", "active"
+    else:
+        completion, suppression, cooldown = "callback_observed", "released", "elapsed"
+    return {
+        "schema_version": "ait_system_speech_lifecycle.v0",
+        "system_speech_session_id": session_id,
+        "speech_session_generation": generation,
+        "playback_event_ref": playback_ref,
+        "lifecycle_state": state,
+        "queue_handoff_status": "accepted",
+        "queue_completion_status": completion,
+        "playback_observation_status": "not_observed",
+        "suppression_status": suppression,
+        "cooldown_status": cooldown,
+        "cooldown_ms": 500,
+        "compare_and_release_required": True,
+        "may_start_user_turn": False,
+        "turn_adoption_authority": False,
+        "raw_text_published": False,
+        "text_hash_published": False,
+        "provider_payload_published": False,
+        "path_published": False,
+        "url_published": False,
+        "raw_audio_published": False,
+        "device_identity_published": False,
+        "private_data_published": False,
+    }
+
+
+def build_self_output_observation(
+    *,
+    generation: int = 7,
+    session_id: str = SYSTEM_SPEECH_SESSION_ID,
+    playback_ref: str = PLAYBACK_EVENT_REF,
+) -> dict[str, object]:
+    return {
+        "schema_version": "audio_self_output_observation.v0",
+        "self_output_observation_ref": SELF_OUTPUT_OBSERVATION_REF,
+        "system_speech_session_id": session_id,
+        "speech_session_generation": generation,
+        "playback_event_ref": playback_ref,
+        "observation_status": "current",
+        "observation_owner": "leased_tts_process_observer",
+        "may_start_user_turn": False,
+        "turn_adoption_authority": False,
+        "raw_private_publication_flags": False,
+    }
+
+
+def build_user_speech_candidate(
+    **overrides: object,
+) -> UserSpeechCandidateEvidence:
+    values: dict[str, object] = {
+        "candidate_id": "ausc_live:cid_dddddddddddddddddddddddddddddddd",
+        "source_kind": "user_speech_candidate",
+        "near_end_evidence_class": "bounded_processed_near_end_candidate",
+        "window_ms": 1000,
+        "packet_count": 50,
+        "processed_byte_count": 16000,
+        "frame_bytes": 320,
+        "storage_class": "in_memory_ephemeral",
+        "aec_or_vad_turn_input_authority": False,
+        "observed_system_speech_session_id": SYSTEM_SPEECH_SESSION_ID,
+        "observed_generation": 7,
+        "active_system_speech_session_id": SYSTEM_SPEECH_SESSION_ID,
+        "active_generation": 7,
+        "playback_event_ref": PLAYBACK_EVENT_REF,
+        "self_output_observation_ref": SELF_OUTPUT_OBSERVATION_REF,
+        "self_output_observation_schema_version": "audio_self_output_observation.v0",
+        "session_join_status": "current_match",
+        "post_compare_session_status": "current_unchanged",
+        "self_output_correlation_class": "not_self_output",
+        "active_session_exclusion_status": "explicitly_excluded_from_candidate",
+        "cooldown_status": "clear",
+        "opaque_refs_non_dereferenceable": True,
+        "decision_owner": "ai_talk_core_input_gate",
+        "acceptance_status": "accepted_user_speech_candidate",
+        "may_materialize_thought_core_turninput": True,
+    }
+    values.update(overrides)
+    return UserSpeechCandidateEvidence(**values)  # type: ignore[arg-type]
+
+
+def prepare_current_input_gate() -> InputGate:
+    gate = InputGate()
+    gate.observe_system_speech_lifecycle(build_system_speech_lifecycle())
+    gate.observe_self_output_observation(build_self_output_observation())
+    return gate
 
 
 def run_handoff_cli(*args: str) -> subprocess.CompletedProcess[str]:
@@ -1671,10 +1786,16 @@ class SmokeTests(unittest.TestCase):
             "/api/events/ingest",
             json={
                 "event": "record_start",
-                "turn_id": "webtestevent",
+                "turn_id": "web_0123456789abcdef0123456789abcdef",
                 "source": "web-ui",
+                "client_timestamp_wall": "2026-07-13T12:00:00.000Z",
                 "client_timestamp_monotonic": 12.5,
-                "payload": {"trigger": "manual"},
+                "client_performance_now": 12_500.0,
+                "payload": {
+                    "trigger": "manual",
+                    "timeslice_ms": 500,
+                    "mime_type": "audio/webm",
+                },
             },
             headers=self.local_api_headers(),
         )
@@ -1683,32 +1804,36 @@ class SmokeTests(unittest.TestCase):
         self.assertIsNotNone(payload)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["event"]["event"], "record_start")
-        self.assertEqual(payload["event"]["turn_id"], "webtestevent")
+        self.assertEqual(
+            payload["event"]["turn_id"],
+            "web_0123456789abcdef0123456789abcdef",
+        )
         self.assertIn("timestamp_wall", payload["event"])
         self.assertIn("timestamp_monotonic", payload["event"])
 
-    def test_api_event_ingest_filters_unexpected_client_payload(self) -> None:
-        """Client-origin events should not persist arbitrary text-bearing fields."""
+    def test_api_event_ingest_rejects_unexpected_client_payload(self) -> None:
+        """Client-origin events should reject arbitrary text-bearing fields."""
         response = self.client.post(
             "/api/events/ingest",
             json={
                 "event": "record_start",
-                "turn_id": "webtestevent",
+                "turn_id": "web_0123456789abcdef0123456789abcdef",
                 "source": "../bad source",
                 "payload": {
                     "trigger": "manual",
+                    "timeslice_ms": 500,
+                    "mime_type": "audio/webm",
                     "transcript": "secret transcript",
                     "nested": {"token": "secret"},
                 },
             },
             headers=self.local_api_headers(),
         )
-        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.status_code, 400)
         payload = response.get_json()
         self.assertIsNotNone(payload)
-        event = payload["event"]
-        self.assertEqual(event["source"], "badsource")
-        self.assertEqual(event["payload"], {"trigger": "manual"})
+        self.assertFalse(payload["ok"])
+        self.assertNotIn("secret transcript", response.get_data(as_text=True))
 
     def test_api_event_ingest_requires_local_token(self) -> None:
         """Event stream inputs expose local timing state and require the UI token."""
@@ -3126,6 +3251,641 @@ class SmokeTests(unittest.TestCase):
         payload = build_input_gate_data(gate.state)
         self.assertEqual(payload["type"], "input_gate_state")
         self.assertFalse(payload["input_enabled"])
+
+    def test_current_independent_user_candidate_consumes_exactly_once(self) -> None:
+        """Only the current complete not-self-output join should mint once."""
+        gate = prepare_current_input_gate()
+        candidate = build_user_speech_candidate()
+        capability = gate.issue_turn_input_capability(candidate)
+        self.assertIsNotNone(capability)
+        self.assertTrue(gate.consume_turn_input_capability(capability, candidate))
+        self.assertFalse(gate.consume_turn_input_capability(capability, candidate))
+        self.assertIsNone(gate.issue_turn_input_capability(candidate))
+
+    def test_private_pcm_session_consumes_before_one_transcription(self) -> None:
+        """MicLoopSession should consume once immediately before private PCM STT."""
+        gate = prepare_current_input_gate()
+        candidate = build_user_speech_candidate()
+        capability = gate.issue_turn_input_capability(candidate)
+        pipeline = mock.Mock()
+
+        def transcribe_private(buffer: object, **_: object) -> TranscriptionResult:
+            chunk = buffer.latest_chunk()
+            chunk.clear()
+            return TranscriptionResult(
+                source="microphone",
+                text="private result",
+                is_final=False,
+                chunk_count=1,
+            )
+
+        pipeline._transcribe_private_buffer_result.side_effect = transcribe_private
+        session = MicLoopSession(
+            pipeline=pipeline,
+            tuning=MicLoopTuning(vad_aggressiveness=2, final_stable_seconds=8),
+            input_gate=gate,
+        )
+        pcm = bytearray(b"\x01\x00" * 160)
+        chunk = AudioChunk(
+            path=None,
+            source="microphone",
+            pcm16=pcm,
+            sample_rate=16_000,
+            storage_class="in_memory_ephemeral",
+            turn_input_authority=False,
+            turn_input_authority_class="processed_near_end_observation_only",
+        )
+        result = session.process_chunk(
+            chunk,
+            has_speech=True,
+            language="ja",
+            chunk_duration=1,
+            is_last_iteration=False,
+            candidate_evidence=candidate,
+            turn_input_capability=capability,
+        )
+        self.assertEqual(result.text, "private result")
+        pipeline._transcribe_private_buffer_result.assert_called_once()
+        self.assertEqual(pcm, bytearray(len(pcm)))
+
+        replay = AudioChunk(
+            path=None,
+            source="microphone",
+            pcm16=bytearray(b"\x01\x00" * 160),
+            sample_rate=16_000,
+            storage_class="in_memory_ephemeral",
+            turn_input_authority=False,
+            turn_input_authority_class="processed_near_end_observation_only",
+        )
+        with self.assertRaises(AudioInputError):
+            session.process_chunk(
+                replay,
+                has_speech=True,
+                language="ja",
+                chunk_duration=1,
+                is_last_iteration=False,
+                candidate_evidence=candidate,
+                turn_input_capability=capability,
+            )
+        pipeline._transcribe_private_buffer_result.assert_called_once()
+        self.assertEqual(replay.pcm16, bytearray(len(replay.pcm16 or b"")))
+
+    def test_private_pcm_pipeline_transcribes_in_memory_and_clears_samples(self) -> None:
+        """The private pipeline should use no path and clear PCM after conversion."""
+        pipeline = TranscriptionPipeline.__new__(TranscriptionPipeline)
+        pipeline.model_name = "test"
+        pipeline.model = mock.Mock()
+        pipeline.model.transcribe.return_value = {"text": " private result "}
+        pcm = bytearray(b"\x01\x00" * 160)
+        chunk = AudioChunk(
+            path=None,
+            source="microphone",
+            pcm16=pcm,
+            sample_rate=16_000,
+            storage_class="in_memory_ephemeral",
+            turn_input_authority=False,
+            turn_input_authority_class="processed_near_end_observation_only",
+        )
+        text = pipeline._transcribe_private_pcm_chunk(chunk, language="ja")
+        self.assertEqual(text, "private result")
+        pipeline.model.transcribe.assert_called_once()
+        model_audio = pipeline.model.transcribe.call_args.args[0]
+        self.assertEqual(float(model_audio.sum()), 0.0)
+        self.assertEqual(pcm, bytearray(len(pcm)))
+
+    def test_private_pcm_chunk_blocks_representation_copy_and_pickle(self) -> None:
+        """Private PCM should not cross representation or object-copy boundaries."""
+        private_marker = b"private-pcm-marker-do-not-echo"
+        pcm = bytearray(private_marker)
+        chunk = AudioChunk(
+            path=None,
+            source="microphone",
+            pcm16=pcm,
+            sample_rate=16_000,
+            storage_class="in_memory_ephemeral",
+            turn_input_authority=False,
+            turn_input_authority_class="processed_near_end_observation_only",
+        )
+        self.assertEqual(repr(chunk), "<audio-chunk private-pcm>")
+        self.assertEqual(str(chunk), repr(chunk))
+        self.assertNotIn(private_marker.decode(), repr(chunk))
+        with self.assertRaises(TypeError):
+            copy.copy(chunk)
+        with self.assertRaises(TypeError):
+            copy.deepcopy(chunk)
+        with self.assertRaises(TypeError):
+            pickle.dumps(chunk)
+
+        file_chunk = AudioChunk(path=Path("prepared.wav"), source="file")
+        for clone in (
+            copy.copy(file_chunk),
+            copy.deepcopy(file_chunk),
+            pickle.loads(pickle.dumps(file_chunk)),
+        ):
+            self.assertEqual(clone, file_chunk)
+            self.assertIsNone(clone.pcm16)
+
+    def test_private_pcm_conversion_and_transcription_failures_clear_storage(self) -> None:
+        """Conversion and model failures should zero every mutable audio buffer."""
+        conversion_marker = "private-conversion-marker-do-not-echo"
+        conversion_pcm = bytearray(b"\x01\x00" * 160)
+        conversion_chunk = AudioChunk(
+            path=None,
+            source="microphone",
+            pcm16=conversion_pcm,
+            sample_rate=16_000,
+            storage_class="in_memory_ephemeral",
+            turn_input_authority=False,
+            turn_input_authority_class="processed_near_end_observation_only",
+        )
+        fake_numpy = mock.Mock()
+        fake_numpy.int16 = object()
+        fake_numpy.float32 = object()
+        fake_view = mock.Mock()
+        fake_view.astype.side_effect = ValueError(conversion_marker)
+        fake_numpy.frombuffer.return_value = fake_view
+        pipeline = TranscriptionPipeline.__new__(TranscriptionPipeline)
+        pipeline.model_name = "test"
+        pipeline.model = mock.Mock()
+        with mock.patch.dict(sys.modules, {"numpy": fake_numpy}):
+            with self.assertRaises(AudioTranscriptionError) as conversion_error:
+                pipeline._transcribe_private_pcm_chunk(conversion_chunk)
+        self.assertNotIn(conversion_marker, str(conversion_error.exception))
+        self.assertEqual(conversion_pcm, bytearray(len(conversion_pcm)))
+        fake_view.fill.assert_called_once_with(0)
+        pipeline.model.transcribe.assert_not_called()
+
+        transcription_marker = "private-transcription-marker-do-not-echo"
+        transcription_pcm = bytearray(b"\x01\x00" * 160)
+        transcription_chunk = AudioChunk(
+            path=None,
+            source="microphone",
+            pcm16=transcription_pcm,
+            sample_rate=16_000,
+            storage_class="in_memory_ephemeral",
+            turn_input_authority=False,
+            turn_input_authority_class="processed_near_end_observation_only",
+        )
+        retained_samples: list[object] = []
+
+        def fail_transcription(samples: object, **_: object) -> object:
+            retained_samples.append(samples)
+            raise RuntimeError(transcription_marker)
+
+        pipeline.model.transcribe.side_effect = fail_transcription
+        with self.assertRaises(AudioTranscriptionError) as transcription_error:
+            pipeline._transcribe_private_pcm_chunk(transcription_chunk)
+        self.assertNotIn(transcription_marker, str(transcription_error.exception))
+        self.assertEqual(transcription_pcm, bytearray(len(transcription_pcm)))
+        self.assertEqual(len(retained_samples), 1)
+        self.assertEqual(float(retained_samples[0].sum()), 0.0)
+
+    def test_concurrent_capability_consumption_has_one_winner(self) -> None:
+        """The pending capability compare-and-consume should be atomic."""
+        gate = prepare_current_input_gate()
+        candidate = build_user_speech_candidate()
+        capability = gate.issue_turn_input_capability(candidate)
+        barrier = threading.Barrier(8)
+        results: list[bool] = []
+        result_lock = threading.Lock()
+
+        def consume() -> None:
+            barrier.wait()
+            result = gate.consume_turn_input_capability(capability, candidate)
+            with result_lock:
+                results.append(result)
+
+        threads = [threading.Thread(target=consume) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 7)
+
+    def test_candidate_join_mismatch_active_cooldown_and_ambiguity_fail_closed(self) -> None:
+        """Every incomplete or non-independent join should issue no capability."""
+        mismatch_cases = {
+            "candidate_id": {"candidate_id": "not-a-private-candidate"},
+            "observed_generation": {"observed_generation": 6},
+            "active_generation": {"active_generation": 8},
+            "session_id": {
+                "observed_system_speech_session_id": (
+                    "system-speech-session:sss_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                )
+            },
+            "playback": {
+                "playback_event_ref": (
+                    "playback-event:pe_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                )
+            },
+            "self_output_ref": {
+                "self_output_observation_ref": (
+                    "self-output-observation:aso_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                )
+            },
+            "ambiguous": {"self_output_correlation_class": "ambiguous"},
+            "self_output": {"self_output_correlation_class": "self_output"},
+            "cooldown": {"cooldown_status": "active"},
+            "aec_authority": {"aec_or_vad_turn_input_authority": True},
+            "decision_owner": {"decision_owner": "caller"},
+            "acceptance": {"acceptance_status": "accepted"},
+        }
+        for name, overrides in mismatch_cases.items():
+            with self.subTest(name=name):
+                gate = prepare_current_input_gate()
+                self.assertIsNone(
+                    gate.issue_turn_input_capability(
+                        build_user_speech_candidate(**overrides)
+                    )
+                )
+        for state in ("handoff_accepted", "cooldown"):
+            with self.subTest(lifecycle_state=state):
+                gate = InputGate()
+                gate.observe_system_speech_lifecycle(
+                    build_system_speech_lifecycle(state)
+                )
+                gate.observe_self_output_observation(
+                    build_self_output_observation()
+                )
+                self.assertIsNone(
+                    gate.issue_turn_input_capability(build_user_speech_candidate())
+                )
+
+    def test_missing_provider_stale_and_toctou_fail_closed(self) -> None:
+        """Provider absence, stale evidence, or post-issue change must block."""
+        missing = InputGate()
+        self.assertIsNone(
+            missing.issue_turn_input_capability(build_user_speech_candidate())
+        )
+        missing.observe_system_speech_lifecycle(build_system_speech_lifecycle())
+        self.assertIsNone(
+            missing.issue_turn_input_capability(build_user_speech_candidate())
+        )
+        with self.assertRaises(InputGateError):
+            missing.observe_self_output_observation(
+                build_self_output_observation(
+                    playback_ref=(
+                        "playback-event:pe_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    )
+                )
+            )
+        with self.assertRaises(InputGateError):
+            missing.observe_system_speech_lifecycle(
+                build_system_speech_lifecycle(generation=6)
+            )
+
+        gate = prepare_current_input_gate()
+        candidate = build_user_speech_candidate()
+        capability = gate.issue_turn_input_capability(candidate)
+        gate.observe_system_speech_lifecycle(
+            build_system_speech_lifecycle(
+                "handoff_accepted",
+                generation=8,
+                session_id=(
+                    "system-speech-session:sss_ffffffffffffffffffffffffffffffff"
+                ),
+                playback_ref=(
+                    "playback-event:pe_ffffffffffffffffffffffffffffffff"
+                ),
+            )
+        )
+        self.assertFalse(gate.consume_turn_input_capability(capability, candidate))
+        self.assertFalse(gate.consume_turn_input_capability(capability, candidate))
+
+    def test_foreign_copy_serialized_and_scalar_capabilities_fail(self) -> None:
+        """Only the exact process-local object and candidate identity may consume."""
+        gate = prepare_current_input_gate()
+        private_marker = "private-candidate-marker-do-not-echo"
+        candidate = build_user_speech_candidate(
+            active_system_speech_session_id=private_marker
+        )
+        self.assertEqual(
+            repr(candidate),
+            "<user-speech-candidate-evidence private>",
+        )
+        self.assertEqual(str(candidate), repr(candidate))
+        self.assertNotIn(private_marker, repr(candidate))
+        with self.assertRaises(TypeError):
+            copy.copy(candidate)
+        with self.assertRaises(TypeError):
+            copy.deepcopy(candidate)
+        with self.assertRaises(TypeError):
+            pickle.dumps(candidate)
+
+        candidate = build_user_speech_candidate()
+        capability = gate.issue_turn_input_capability(candidate)
+        self.assertIsNotNone(capability)
+        self.assertEqual(repr(capability), "<turn-input-capability private>")
+        with self.assertRaises(TypeError):
+            bool(capability)
+        with self.assertRaises(TypeError):
+            copy.copy(capability)
+        with self.assertRaises(TypeError):
+            copy.deepcopy(capability)
+        with self.assertRaises(TypeError):
+            pickle.dumps(capability)
+        with self.assertRaises(TypeError):
+            json.dumps(capability)
+        with self.assertRaises(TypeError):
+            vars(capability)
+
+        foreign_gate = prepare_current_input_gate()
+        self.assertFalse(
+            foreign_gate.consume_turn_input_capability(capability, candidate)
+        )
+        copied_candidate = build_user_speech_candidate()
+        self.assertIsNot(copied_candidate, candidate)
+        self.assertFalse(
+            gate.consume_turn_input_capability(capability, copied_candidate)
+        )
+        for substitute in (
+            None,
+            True,
+            False,
+            1,
+            "accepted_user_speech_candidate",
+            {},
+            {"capability": repr(capability)},
+            object(),
+        ):
+            with self.subTest(substitute=type(substitute).__name__):
+                self.assertFalse(
+                    gate.consume_turn_input_capability(substitute, candidate)
+                )
+        self.assertTrue(gate.consume_turn_input_capability(capability, candidate))
+        serialized_surfaces = json.dumps(
+            {
+                "gate": gate.state.to_payload(),
+                "health": build_input_gate_response(gate.state),
+            }
+        )
+        self.assertNotIn("capability", serialized_surfaces)
+        self.assertNotIn("candidate_id", serialized_surfaces)
+
+    def test_audiochunk_aec_vad_and_helper_values_cannot_promote_pcm(self) -> None:
+        """PCM metadata and helper values should never substitute gate authority."""
+        with self.assertRaises(AudioInputError):
+            AudioChunk(
+                path=None,
+                source="microphone",
+                pcm16=bytearray(b"\x01\x00"),
+                sample_rate=16_000,
+                storage_class="in_memory_ephemeral",
+                turn_input_authority=True,
+                turn_input_authority_class="accepted_user_speech_candidate",
+            )
+        pipeline = mock.Mock()
+        session = MicLoopSession(
+            pipeline=pipeline,
+            tuning=MicLoopTuning(vad_aggressiveness=2, final_stable_seconds=8),
+            input_gate=InputGate(initially_enabled=True),
+        )
+        for substitute in (None, True, "aec_selected", {"has_speech": True}):
+            pcm = bytearray(b"\x01\x00" * 160)
+            chunk = AudioChunk(
+                path=None,
+                source="microphone",
+                pcm16=pcm,
+                sample_rate=16_000,
+                storage_class="in_memory_ephemeral",
+                turn_input_authority=False,
+                turn_input_authority_class="processed_near_end_observation_only",
+            )
+            with self.subTest(substitute=substitute):
+                with self.assertRaises(AudioInputError):
+                    session.process_chunk(
+                        chunk,
+                        has_speech=True,
+                        language="ja",
+                        chunk_duration=1,
+                        is_last_iteration=False,
+                        candidate_evidence=build_user_speech_candidate(),
+                        turn_input_capability=substitute,
+                    )
+                self.assertEqual(pcm, bytearray(len(pcm)))
+        pipeline._transcribe_private_buffer_result.assert_not_called()
+
+        silence_pcm = bytearray(b"\x01\x00" * 160)
+        silence = session.process_chunk(
+            AudioChunk(
+                path=None,
+                source="microphone",
+                pcm16=silence_pcm,
+                sample_rate=16_000,
+                storage_class="in_memory_ephemeral",
+                turn_input_authority=False,
+                turn_input_authority_class="processed_near_end_observation_only",
+            ),
+            has_speech=False,
+            language="ja",
+            chunk_duration=1,
+            is_last_iteration=False,
+        )
+        self.assertTrue(silence.is_silence)
+        self.assertEqual(silence_pcm, bytearray(len(silence_pcm)))
+
+    def test_http_intake_is_observation_only_and_gate_update_is_capture_only(self) -> None:
+        """JSON intake may update observations or capture state, never capability."""
+        app = create_app()
+        app.config[ENABLE_PROCESS_SHUTDOWN_CONFIG] = False
+        client = app.test_client()
+        headers = {"X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]}
+        for event_name, payload in (
+            (
+                "swordAgentSystemSpeechLifecycleV0",
+                build_system_speech_lifecycle(),
+            ),
+            (
+                "audioSelfOutputObservationV0",
+                build_self_output_observation(),
+            ),
+        ):
+            response = client.post(
+                "/api/events/ingest",
+                headers=headers,
+                json={"event": event_name, "payload": payload},
+            )
+            self.assertEqual(response.status_code, 202)
+            response_text = response.get_data(as_text=True)
+            self.assertNotIn(SYSTEM_SPEECH_SESSION_ID, response_text)
+            self.assertNotIn(PLAYBACK_EVENT_REF, response_text)
+            self.assertNotIn("capability", response_text)
+
+        response = client.post(
+            "/api/input-gate",
+            headers=headers,
+            json={
+                "input_enabled": True,
+                "reason": "capture-only",
+                "candidate_id": "ausc_live:cid_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "may_materialize_thought_core_turninput": True,
+                "capability": {"accepted": True},
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(
+            set(payload["input_gate"]),
+            {"type", "input_enabled", "reason", "source", "timestamp"},
+        )
+        serialized = json.dumps(payload)
+        self.assertNotIn("capability", serialized)
+        self.assertNotIn("candidate_id", serialized)
+        for endpoint in ("/api/health", "/api/status"):
+            status = client.get(endpoint, headers=headers)
+            self.assertEqual(status.status_code, 200)
+            self.assertNotIn("capability", status.get_data(as_text=True))
+            self.assertNotIn("candidate_id", status.get_data(as_text=True))
+
+    def test_web_event_and_gate_fields_never_echo_private_markers(self) -> None:
+        """Strict event/gate parsing should reject or classify every marker."""
+        marker = "private-web-marker-do-not-echo"
+        app = create_app()
+        app.config[ENABLE_PROCESS_SHUTDOWN_CONFIG] = False
+        client = app.test_client()
+        headers = {"X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]}
+        valid_timing: dict[str, object] = {
+            "client_timestamp_wall": "2026-07-13T12:00:00.000Z",
+            "client_timestamp_monotonic": 12.5,
+            "client_performance_now": 12_500.0,
+        }
+        valid_record_start: dict[str, object] = {
+            "event": "record_start",
+            "turn_id": "web_abcdef0123456789abcdef0123456789",
+            "source": "web-ui",
+            "payload": {
+                "trigger": "manual",
+                "timeslice_ms": 500,
+                "mime_type": "audio/webm",
+            },
+            **valid_timing,
+        }
+
+        def assert_rejected(body: dict[str, object]) -> None:
+            response = client.post(
+                "/api/events/ingest",
+                headers=headers,
+                json=body,
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertNotIn(marker, response.get_data(as_text=True))
+
+        for field in ("event", "turn_id", "source", "payload"):
+            with self.subTest(event_top_level_field=field):
+                body = copy.deepcopy(valid_record_start)
+                body[field] = marker
+                assert_rejected(body)
+        for field in (
+            "client_timestamp_wall",
+            "client_timestamp_monotonic",
+            "client_performance_now",
+        ):
+            with self.subTest(event_timing_field=field):
+                body = copy.deepcopy(valid_record_start)
+                body[field] = marker
+                assert_rejected(body)
+        unexpected = copy.deepcopy(valid_record_start)
+        unexpected["capability"] = marker
+        assert_rejected(unexpected)
+
+        for field in ("trigger", "timeslice_ms", "mime_type"):
+            with self.subTest(record_start_field=field):
+                body = copy.deepcopy(valid_record_start)
+                body["payload"][field] = marker
+                assert_rejected(body)
+
+        valid_record_stop: dict[str, object] = {
+            "event": "record_stop",
+            "turn_id": "web_abcdef0123456789abcdef0123456789",
+            "source": "web-ui",
+            "payload": {
+                "chunk_count": 1,
+                "chunk_sequence": 1,
+                "blob_size_bytes": 640,
+            },
+            **valid_timing,
+        }
+        for field in ("chunk_count", "chunk_sequence", "blob_size_bytes"):
+            with self.subTest(record_stop_field=field):
+                body = copy.deepcopy(valid_record_stop)
+                body["payload"][field] = marker
+                assert_rejected(body)
+
+        lifecycle = build_system_speech_lifecycle()
+        for field in lifecycle:
+            with self.subTest(lifecycle_field=field):
+                mutated = dict(lifecycle)
+                mutated[field] = marker
+                assert_rejected(
+                    {
+                        "event": "swordAgentSystemSpeechLifecycleV0",
+                        "payload": mutated,
+                    }
+                )
+        accepted_lifecycle = client.post(
+            "/api/events/ingest",
+            headers=headers,
+            json={
+                "event": "swordAgentSystemSpeechLifecycleV0",
+                "payload": lifecycle,
+            },
+        )
+        self.assertEqual(accepted_lifecycle.status_code, 202)
+        observation = build_self_output_observation()
+        for field in observation:
+            with self.subTest(self_output_field=field):
+                mutated = dict(observation)
+                mutated[field] = marker
+                assert_rejected(
+                    {
+                        "event": "audioSelfOutputObservationV0",
+                        "payload": mutated,
+                    }
+                )
+        for extra_field in ("candidate", "capability", "pcm16"):
+            with self.subTest(observation_extra_field=extra_field):
+                mutated = dict(observation)
+                mutated[extra_field] = marker
+                assert_rejected(
+                    {
+                        "event": "audioSelfOutputObservationV0",
+                        "payload": mutated,
+                    }
+                )
+
+        gate_cases = (
+            {"input_enabled": marker},
+            {"mic_enabled": marker},
+            {"enabled": marker},
+            {"input_enabled": True, "timestamp": marker},
+            {"input_enabled": True, "reason": marker},
+            {"input_enabled": True, "source": marker},
+            {"input_enabled": True, "candidate_id": marker},
+            {"input_enabled": True, "capability": {"value": marker}},
+            {"input_enabled": True, "pcm16": marker},
+        )
+        for gate_body in gate_cases:
+            with self.subTest(gate_fields=tuple(gate_body)):
+                response = client.post(
+                    "/api/input-gate",
+                    headers=headers,
+                    json=gate_body,
+                )
+                self.assertIn(response.status_code, {200, 400})
+                self.assertNotIn(marker, response.get_data(as_text=True))
+
+        for endpoint in ("/api/health", "/api/status", "/api/events?once=1"):
+            response = client.get(endpoint, headers=headers)
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn(marker, response.get_data(as_text=True))
+        for event in read_event_log_events(limit=100):
+            self.assertNotIn(marker, json.dumps(event))
+            self.assertNotIn(
+                marker,
+                format_sse_event(event, str(event.get("event", "message"))),
+            )
 
     def test_maybe_finalize_on_silence_returns_final_result(self) -> None:
         """A silence chunk after repeated speech should finalize the last speech."""

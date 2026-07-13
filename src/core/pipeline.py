@@ -8,13 +8,15 @@ import threading
 from typing import Any
 
 from src.io.audio import (
+    AudioEnvironmentError,
     AudioInputError,
+    AudioTranscriptionError,
     load_transcription_model,
     transcribe_file,
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class AudioChunk:
     """A captured audio chunk ready for transcription."""
 
@@ -25,6 +27,61 @@ class AudioChunk:
     storage_class: str = "file"
     turn_input_authority: bool = True
     turn_input_authority_class: str = "file_input"
+
+    def __repr__(self) -> str:
+        if self.pcm16 is not None:
+            return "<audio-chunk private-pcm>"
+        return (
+            "AudioChunk("
+            f"path={self.path!r}, source={self.source!r}, pcm16=None, "
+            f"sample_rate={self.sample_rate!r}, storage_class={self.storage_class!r}, "
+            f"turn_input_authority={self.turn_input_authority!r}, "
+            f"turn_input_authority_class={self.turn_input_authority_class!r})"
+        )
+
+    __str__ = __repr__
+
+    def __copy__(self) -> AudioChunk:
+        if self.pcm16 is not None:
+            raise TypeError("private PCM audio chunk cannot be copied")
+        return self._copy_file_chunk()
+
+    def __deepcopy__(self, memo: object) -> AudioChunk:
+        del memo
+        if self.pcm16 is not None:
+            raise TypeError("private PCM audio chunk cannot be copied")
+        return self._copy_file_chunk()
+
+    def __reduce__(self) -> object:
+        return self.__reduce_ex__(4)
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        if self.pcm16 is not None:
+            raise TypeError("private PCM audio chunk cannot be serialized")
+        return (
+            type(self),
+            (
+                self.path,
+                self.source,
+                None,
+                self.sample_rate,
+                self.storage_class,
+                self.turn_input_authority,
+                self.turn_input_authority_class,
+            ),
+        )
+
+    def _copy_file_chunk(self) -> AudioChunk:
+        return type(self)(
+            path=self.path,
+            source=self.source,
+            pcm16=None,
+            sample_rate=self.sample_rate,
+            storage_class=self.storage_class,
+            turn_input_authority=self.turn_input_authority,
+            turn_input_authority_class=self.turn_input_authority_class,
+        )
 
     def __post_init__(self) -> None:
         has_path = self.path is not None
@@ -103,6 +160,47 @@ class TranscriptionPipeline:
             raise AudioInputError("audio chunk source is unavailable")
         return transcribe_file(audio_path=chunk.path, model=self.model, language=language)
 
+    def _transcribe_private_pcm_chunk(
+        self,
+        chunk: AudioChunk,
+        language: str | None = None,
+    ) -> str:
+        """Transcribe ephemeral PCM after MicLoopSession consumes gate authority."""
+        if chunk.pcm16 is None or chunk.path is not None:
+            raise AudioInputError("private PCM chunk is unavailable")
+        try:
+            import numpy as np
+        except ImportError as exc:
+            chunk.clear()
+            raise AudioEnvironmentError("private PCM decoder is unavailable") from exc
+        pcm_view: Any = None
+        samples: Any = None
+        options: dict[str, Any] = {}
+        if language:
+            options["language"] = language
+        try:
+            pcm_view = np.frombuffer(chunk.pcm16, dtype=np.int16)
+            samples = pcm_view.astype(np.float32)
+            samples /= 32768.0
+            result = self.model.transcribe(samples, **options)
+            text = str(result.get("text", "")).strip()
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "cuda" in message or "cudnn" in message or "torch" in message:
+                raise AudioEnvironmentError(
+                    "private transcription runtime environment error"
+                ) from exc
+            raise AudioTranscriptionError("private transcription runtime failed") from exc
+        except Exception as exc:
+            raise AudioTranscriptionError("private transcription failed") from exc
+        finally:
+            chunk.clear()
+            if pcm_view is not None:
+                pcm_view.fill(0)
+            if samples is not None:
+                samples.fill(0)
+        return text
+
     def transcribe_buffer(self, buffer: AudioBuffer, language: str | None = None) -> str:
         """Transcribe the latest chunk from a buffer."""
         return self.transcribe_chunk(buffer.latest_chunk(), language=language)
@@ -115,6 +213,24 @@ class TranscriptionPipeline:
     ) -> TranscriptionResult:
         """Transcribe the latest chunk and return a realtime-style result."""
         text = self.transcribe_buffer(buffer, language=language)
+        return TranscriptionResult(
+            source=buffer.source,
+            text=text,
+            is_final=is_final,
+            chunk_count=len(buffer.chunks),
+        )
+
+    def _transcribe_private_buffer_result(
+        self,
+        buffer: AudioBuffer,
+        language: str | None = None,
+        is_final: bool = False,
+    ) -> TranscriptionResult:
+        """Return one private PCM result after the session's atomic consume."""
+        text = self._transcribe_private_pcm_chunk(
+            buffer.latest_chunk(),
+            language=language,
+        )
         return TranscriptionResult(
             source=buffer.source,
             text=text,

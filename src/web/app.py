@@ -8,9 +8,11 @@ from datetime import UTC, datetime
 import hmac
 from ipaddress import ip_address
 import json
+import math
 import os
 from pathlib import Path
 import queue
+import re
 import secrets
 import signal
 import shutil
@@ -37,7 +39,6 @@ from src.core.events import (
     get_event_bus,
     get_event_log_path,
     new_turn_id,
-    normalize_event_source,
     read_event_log_events,
 )
 from src.core.input_gate import InputGate, InputGateError, InputGateState
@@ -104,6 +105,32 @@ CLIENT_EVENT_TIMING_KEYS = {
     "client_timestamp_monotonic",
     "client_performance_now",
 }
+CLIENT_EVENT_NAMES = {
+    "record_start",
+    "record_stop",
+    "swordAgentSystemSpeechLifecycleV0",
+    "audioSelfOutputObservationV0",
+}
+CLIENT_EVENT_TOP_LEVEL_KEYS = {
+    "event",
+    "turn_id",
+    "source",
+    "payload",
+    *CLIENT_EVENT_TIMING_KEYS,
+}
+CLIENT_EVENT_SOURCE_BY_NAME = {
+    "record_start": "web-ui",
+    "record_stop": "web-ui",
+    "swordAgentSystemSpeechLifecycleV0": "self-output-awareness-controller",
+    "audioSelfOutputObservationV0": "self-output-awareness-controller",
+}
+RECORD_START_PAYLOAD_KEYS = {"trigger", "timeslice_ms", "mime_type"}
+RECORD_STOP_PAYLOAD_KEYS = {"chunk_count", "chunk_sequence", "blob_size_bytes"}
+CLIENT_RECORDING_MIME_TYPES = {"", "audio/webm", "audio/webm;codecs=opus"}
+CLIENT_TURN_ID_PATTERN = re.compile(r"^web_[a-f0-9]{32}$")
+CLIENT_WALL_TIMESTAMP_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
+)
 
 
 class WebRuntimeState:
@@ -389,21 +416,32 @@ def create_app(
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
             return jsonify({"ok": False, "error": "request body must be a JSON object"}), 400
-        event_name = normalize_event_name(payload.get("event"))
-        if not event_name:
-            return jsonify({"ok": False, "error": "event is required"}), 400
-        turn_id = normalize_turn_id(payload.get("turn_id")) or new_turn_id("web")
-        event_payload = payload.get("payload")
-        if not isinstance(event_payload, dict):
+        try:
+            event_name = validate_client_event_name(payload.get("event"))
+            validate_client_event_top_level(payload)
+            turn_id = validate_client_turn_id(payload.get("turn_id"))
+            source = validate_client_event_source(payload.get("source"), event_name)
+            event_payload = validate_client_event_payload(
+                event_name,
+                payload.get("payload"),
+            )
+            timing_payload = validate_client_event_timing(payload)
+            if event_name == "swordAgentSystemSpeechLifecycleV0":
+                input_gate.observe_system_speech_lifecycle(event_payload)
+            elif event_name == "audioSelfOutputObservationV0":
+                input_gate.observe_self_output_observation(event_payload)
+        except InputGateError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        if event_name in {
+            "swordAgentSystemSpeechLifecycleV0",
+            "audioSelfOutputObservationV0",
+        }:
             event_payload = {}
-        event_payload = filter_client_event_payload(event_payload)
-        for key in CLIENT_EVENT_TIMING_KEYS:
-            if key in payload:
-                event_payload[key] = payload[key]
+        event_payload.update(timing_payload)
         event = emit_event(
             event_name,
             turn_id=turn_id,
-            source=normalize_event_source(payload.get("source"), default="web-ui"),
+            source=source,
             payload=event_payload,
         )
         return jsonify({"ok": True, "event": event.to_payload()}), 202
@@ -1025,12 +1063,121 @@ def resolve_event_trace_limit(value: object) -> int:
     return parsed
 
 
-def filter_client_event_payload(payload: dict[str, object]) -> dict[str, object]:
-    """Keep only timing fields the browser UI is expected to send."""
+def validate_client_event_name(value: object) -> str:
+    """Return one fixed event name accepted from the local client boundary."""
+    if not isinstance(value, str) or value not in CLIENT_EVENT_NAMES:
+        raise InputGateError("client event name is invalid")
+    return value
+
+
+def validate_client_event_top_level(payload: dict[str, object]) -> None:
+    """Reject unexpected client fields instead of filtering private markers."""
+    if "event" not in payload or "payload" not in payload:
+        raise InputGateError("client event fields are invalid")
+    if not set(payload).issubset(CLIENT_EVENT_TOP_LEVEL_KEYS):
+        raise InputGateError("client event fields are invalid")
+
+
+def validate_client_turn_id(value: object) -> str:
+    """Accept only browser-generated opaque turn ids, or create one locally."""
+    if value is None:
+        return new_turn_id("web")
+    if not isinstance(value, str) or CLIENT_TURN_ID_PATTERN.fullmatch(value) is None:
+        raise InputGateError("client turn id is invalid")
+    return value
+
+
+def validate_client_event_source(value: object, event_name: str) -> str:
+    """Return the fixed source class for one allowed local event."""
+    expected = CLIENT_EVENT_SOURCE_BY_NAME[event_name]
+    if value is None:
+        return expected
+    if not isinstance(value, str) or value != expected:
+        raise InputGateError("client event source is invalid")
+    return expected
+
+
+def validate_client_event_payload(
+    event_name: str,
+    value: object,
+) -> dict[str, object]:
+    """Validate exact class/count payloads without retaining arbitrary values."""
+    if not isinstance(value, dict):
+        raise InputGateError("client event payload is invalid")
+    if event_name == "record_start":
+        if set(value) != RECORD_START_PAYLOAD_KEYS:
+            raise InputGateError("record-start payload fields are invalid")
+        trigger = value.get("trigger")
+        timeslice_ms = value.get("timeslice_ms")
+        mime_type = value.get("mime_type")
+        if trigger not in {"manual", "input_gate"}:
+            raise InputGateError("record-start trigger is invalid")
+        if type(timeslice_ms) is not int or timeslice_ms != WEB_RECORDING_CHUNK_TIMESLICE_MS:
+            raise InputGateError("record-start timeslice is invalid")
+        if not isinstance(mime_type, str) or mime_type not in CLIENT_RECORDING_MIME_TYPES:
+            raise InputGateError("record-start media class is invalid")
+        return {
+            "trigger": trigger,
+            "timeslice_ms": timeslice_ms,
+            "mime_type": mime_type,
+        }
+    if event_name == "record_stop":
+        if set(value) != RECORD_STOP_PAYLOAD_KEYS:
+            raise InputGateError("record-stop payload fields are invalid")
+        chunk_count = value.get("chunk_count")
+        chunk_sequence = value.get("chunk_sequence")
+        blob_size_bytes = value.get("blob_size_bytes")
+        if type(chunk_count) is not int or not 0 <= chunk_count <= WEB_MAX_RECORDING_CHUNKS:
+            raise InputGateError("record-stop chunk count is invalid")
+        if type(chunk_sequence) is not int or not 0 <= chunk_sequence <= WEB_MAX_RECORDING_CHUNKS:
+            raise InputGateError("record-stop chunk sequence is invalid")
+        if type(blob_size_bytes) is not int or not 0 <= blob_size_bytes <= WEB_MAX_UPLOAD_BYTES:
+            raise InputGateError("record-stop byte count is invalid")
+        return {
+            "chunk_count": chunk_count,
+            "chunk_sequence": chunk_sequence,
+            "blob_size_bytes": blob_size_bytes,
+        }
+    return value
+
+
+def validate_client_event_timing(payload: dict[str, object]) -> dict[str, object]:
+    """Accept either no client timing or one complete, bounded timing tuple."""
+    present = set(payload).intersection(CLIENT_EVENT_TIMING_KEYS)
+    if not present:
+        return {}
+    if present != CLIENT_EVENT_TIMING_KEYS:
+        raise InputGateError("client event timing fields are incomplete")
+    wall = payload.get("client_timestamp_wall")
+    monotonic = payload.get("client_timestamp_monotonic")
+    performance_now = payload.get("client_performance_now")
+    if (
+        not isinstance(wall, str)
+        or len(wall) > 27
+        or CLIENT_WALL_TIMESTAMP_PATTERN.fullmatch(wall) is None
+    ):
+        raise InputGateError("client wall timestamp is invalid")
+    try:
+        parsed_wall = datetime.fromisoformat(wall.replace("Z", "+00:00"))
+    except ValueError:
+        raise InputGateError("client wall timestamp is invalid") from None
+    if parsed_wall.tzinfo != UTC or not 2020 <= parsed_wall.year <= 2100:
+        raise InputGateError("client wall timestamp is outside the allowed range")
+    for field_name, field_value in (
+        ("client monotonic timestamp", monotonic),
+        ("client performance timestamp", performance_now),
+    ):
+        if (
+            isinstance(field_value, bool)
+            or not isinstance(field_value, (int, float))
+            or not math.isfinite(float(field_value))
+            or not 0 <= float(field_value) <= 1_000_000_000_000
+        ):
+            raise InputGateError(f"{field_name} is invalid")
     return {
-        str(key): value
-        for key, value in payload.items()
-        if key in CLIENT_EVENT_PAYLOAD_KEYS
+        "client_timestamp_wall": wall,
+        "client_timestamp_monotonic": float(monotonic),
+        "client_performance_now": float(performance_now),
     }
 
 

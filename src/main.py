@@ -232,11 +232,6 @@ def run_mic_loop(
                 trim_silence_enabled=trim_silence_enabled,
                 aec_owner_selection=aec_owner_selection,
             )
-            if not chunk.turn_input_authority:
-                chunk.clear()
-                raise AudioInputError(
-                    "live AEC observation lacks genuine-user TurnInput authority"
-                )
             active_session = get_session()
             result = active_session.process_chunk(
                 chunk,
@@ -661,11 +656,6 @@ def main() -> int:
                 backend=args.mic_backend,
                 trim_silence_enabled=not args.no_trim_silence,
             )
-            if not chunk.turn_input_authority:
-                chunk.clear()
-                raise AudioInputError(
-                    "live AEC observation lacks genuine-user TurnInput authority"
-                )
             record_payload: dict[str, object] = {
                 "transport": "cli_microphone",
                 "duration_seconds": args.duration,

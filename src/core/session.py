@@ -10,7 +10,13 @@ from src.core.finalization import (
     normalize_transcript_text,
     should_mark_result_final,
 )
-from src.core.input_gate import InputGate, InputGateEvent, InputGateState
+from src.core.input_gate import (
+    InputGate,
+    InputGateEvent,
+    InputGateState,
+    UserSpeechCandidateEvidence,
+)
+from src.io.audio import AudioInputError
 from src.core.pipeline import AudioBuffer, AudioChunk, TranscriptionPipeline, TranscriptionResult
 
 
@@ -95,18 +101,52 @@ class MicLoopSession:
         language: str | None,
         chunk_duration: int,
         is_last_iteration: bool,
+        candidate_evidence: UserSpeechCandidateEvidence | None = None,
+        turn_input_capability: object | None = None,
     ) -> TranscriptionResult:
         """Consume one captured chunk and return the current mic-loop result."""
         if not self.should_accept_input():
+            chunk.clear()
             return self.process_input_disabled(is_last_iteration=is_last_iteration)
-        self.state.buffer.append(chunk)
-        if has_speech:
-            result = self.pipeline.transcribe_buffer_result(
-                self.state.buffer,
-                language=language,
+        if chunk.pcm16 is not None and not has_speech:
+            if candidate_evidence is not None and turn_input_capability is not None:
+                self.input_gate.consume_turn_input_capability(
+                    turn_input_capability,
+                    candidate_evidence,
+                )
+            chunk.clear()
+            result = TranscriptionResult(
+                source=self.state.buffer.source,
+                text="",
                 is_final=False,
+                chunk_count=len(self.state.buffer.chunks),
+                is_silence=True,
             )
         else:
+            self.state.buffer.append(chunk)
+        if has_speech:
+            if chunk.pcm16 is not None:
+                if not self.input_gate.consume_turn_input_capability(
+                    turn_input_capability,
+                    candidate_evidence,
+                ):
+                    self.state.buffer.chunks.pop()
+                    chunk.clear()
+                    raise AudioInputError(
+                        "private live candidate lacks InputGate authority"
+                    )
+                result = self.pipeline._transcribe_private_buffer_result(
+                    self.state.buffer,
+                    language=language,
+                    is_final=False,
+                )
+            else:
+                result = self.pipeline.transcribe_buffer_result(
+                    self.state.buffer,
+                    language=language,
+                    is_final=False,
+                )
+        elif chunk.pcm16 is None:
             result = TranscriptionResult(
                 source=self.state.buffer.source,
                 text="",
