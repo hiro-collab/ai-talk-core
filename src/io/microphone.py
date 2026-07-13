@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 from src.core.pipeline import AudioChunk
 from src.io.aec_reference import (
+    LIVE_CAPTURE_MODE_AEC,
     LiveAecCaptureError,
     LiveAecProcessedCapture,
     capture_live_aec_processed_pcm,
@@ -466,6 +467,7 @@ def capture_live_microphone_candidate_window(
     *,
     window_ms: int,
     deadline_ms: int,
+    processing_mode_class: str = LIVE_CAPTURE_MODE_AEC,
     live_aec_capture: Callable[..., LiveAecProcessedCapture] = (
         capture_live_aec_processed_pcm
     ),
@@ -476,6 +478,7 @@ def capture_live_microphone_candidate_window(
             owner_selection=get_adopted_live_aec_owner_selection(),
             window_ms=window_ms,
             deadline_ms=deadline_ms,
+            processing_mode_class=processing_mode_class,
         )
     except LiveAecCaptureError as exc:
         raise AudioEnvironmentError(exc.failure_class) from None

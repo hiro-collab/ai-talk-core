@@ -460,7 +460,22 @@ def create_app(
             )
             timing_payload = validate_client_event_timing(payload)
             if event_name == "swordAgentSystemSpeechLifecycleV0":
-                input_gate.observe_system_speech_lifecycle(event_payload)
+                if (
+                    "source" not in payload
+                    or "turn_id" not in payload
+                    or not timing_payload
+                ):
+                    raise InputGateError(
+                        "system speech transport context is incomplete"
+                    )
+                input_gate.observe_system_speech_lifecycle(
+                    event_payload,
+                    transport_source=source,
+                    transport_turn_id=turn_id,
+                    transport_wall_timestamp=str(
+                        timing_payload["client_timestamp_wall"]
+                    ),
+                )
             elif event_name == "audioSelfOutputObservationV0":
                 input_gate.observe_self_output_observation(event_payload)
         except InputGateError as exc:
@@ -732,6 +747,9 @@ def execute_live_candidate_window(
         capture_window = capture_live_microphone_candidate_window(
             window_ms=window_ms,
             deadline_ms=deadline_ms,
+            processing_mode_class=(
+                input_gate.live_capture_processing_mode_class()
+            ),
         )
         packet_count = capture_window.packet_count
         byte_count = capture_window.processed_byte_count

@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import unittest
+from typing import Any
 from unittest import mock
 
 from src.core.handoff_bridge import (
@@ -47,6 +48,8 @@ from src.core.input_gate import (
     InputGate,
     InputGateError,
     InputGateEvent,
+    LIVE_CAPTURE_MODE_AEC,
+    LIVE_CAPTURE_MODE_NS_AGC,
     UserSpeechCandidateEvidence,
     parse_input_gate_payload,
 )
@@ -195,6 +198,8 @@ PLAYBACK_EVENT_REF = "playback-event:pe_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 SELF_OUTPUT_OBSERVATION_REF = (
     "self-output-observation:aso_cccccccccccccccccccccccccccccccc"
 )
+LIFECYCLE_TRANSPORT_SOURCE = "self-output-awareness-controller"
+LIFECYCLE_TRANSPORT_TURN_ID = "web_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 
 def build_system_speech_lifecycle(
@@ -256,6 +261,57 @@ def build_self_output_observation(
     }
 
 
+def observe_gate_lifecycle(
+    gate: InputGate,
+    payload: Mapping[str, object],
+    *,
+    turn_id: str = LIFECYCLE_TRANSPORT_TURN_ID,
+    wall_timestamp: str = "2026-07-13T12:00:00.000Z",
+) -> None:
+    gate.observe_system_speech_lifecycle(
+        payload,
+        transport_source=LIFECYCLE_TRANSPORT_SOURCE,
+        transport_turn_id=turn_id,
+        transport_wall_timestamp=wall_timestamp,
+    )
+
+
+def post_current_lifecycle_events(
+    client: Any,
+    headers: Mapping[str, str],
+) -> None:
+    for index, state in enumerate(
+        ("handoff_accepted", "cooldown", "released")
+    ):
+        response = client.post(
+            "/api/events/ingest",
+            headers=headers,
+            json={
+                "event": "swordAgentSystemSpeechLifecycleV0",
+                "turn_id": "web_abcdef0123456789abcdef0123456789",
+                "source": "self-output-awareness-controller",
+                "payload": build_system_speech_lifecycle(state),
+                "client_timestamp_wall": (
+                    f"2026-07-13T12:00:0{index}.000Z"
+                ),
+                "client_timestamp_monotonic": 12.5 + index,
+                "client_performance_now": 12_500.0 + index,
+            },
+        )
+        if response.status_code != 202:
+            raise AssertionError("canonical lifecycle setup failed")
+    observation = client.post(
+        "/api/events/ingest",
+        headers=headers,
+        json={
+            "event": "audioSelfOutputObservationV0",
+            "payload": build_self_output_observation(),
+        },
+    )
+    if observation.status_code != 202:
+        raise AssertionError("canonical self-output setup failed")
+
+
 def build_user_speech_candidate(
     **overrides: object,
 ) -> UserSpeechCandidateEvidence:
@@ -292,7 +348,16 @@ def build_user_speech_candidate(
 
 def prepare_current_input_gate() -> InputGate:
     gate = InputGate()
-    gate.observe_system_speech_lifecycle(build_system_speech_lifecycle())
+    for state, wall_timestamp in (
+        ("handoff_accepted", "2026-07-13T12:00:00.000Z"),
+        ("cooldown", "2026-07-13T12:00:01.000Z"),
+        ("released", "2026-07-13T12:00:02.000Z"),
+    ):
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle(state),
+            wall_timestamp=wall_timestamp,
+        )
     gate.observe_self_output_observation(build_self_output_observation())
     return gate
 
@@ -766,6 +831,7 @@ class SmokeTests(unittest.TestCase):
                 self.stdin = self._private_stdin
                 self.returncode = None
                 self.lease_keys: set[str] = set()
+                self.processing_mode_class = ""
                 self.private_input_cleared = False
                 created_processes.append(self)
 
@@ -773,6 +839,9 @@ class SmokeTests(unittest.TestCase):
                 del timeout
                 payload = json.loads(bytes(self._private_stdin.buffer).decode("utf-8"))
                 self.lease_keys = set(payload)
+                self.processing_mode_class = str(
+                    payload.get("processing_mode_class") or ""
+                )
                 self._private_stdin.buffer[:] = b"\x00" * len(
                     self._private_stdin.buffer
                 )
@@ -830,9 +899,18 @@ class SmokeTests(unittest.TestCase):
 
         helper_path = Path(__file__)
         with (
-            mock.patch("src.io.aec_reference._resolve_powershell_executable", return_value="pwsh"),
-            mock.patch("src.io.aec_reference._current_process_creation_utc_ticks", return_value=123),
-            mock.patch("src.io.aec_reference._utc_now_dotnet_ticks", return_value=456),
+            mock.patch(
+                "src.io.aec_reference._resolve_powershell_executable",
+                return_value="pwsh",
+            ),
+            mock.patch(
+                "src.io.aec_reference._current_process_creation_utc_ticks",
+                return_value=123,
+            ),
+            mock.patch(
+                "src.io.aec_reference._utc_now_dotnet_ticks",
+                return_value=456,
+            ),
         ):
             capture = capture_live_aec_processed_pcm(
                 owner_selection=selection,
@@ -858,9 +936,14 @@ class SmokeTests(unittest.TestCase):
                 "expires_utc_ticks",
                 "aec_owner_selection_class",
                 "selected_owner_class",
+                "processing_mode_class",
             },
         )
         self.assertTrue(process.private_input_cleared)
+        self.assertEqual(
+            process.processing_mode_class,
+            LIVE_CAPTURE_MODE_AEC,
+        )
         self.assertEqual(server.expected_pid, 4321)
         self.assertGreater(server.expires_utc_ticks, 456)
         self.assertEqual(server.close_count, 1)
@@ -871,6 +954,57 @@ class SmokeTests(unittest.TestCase):
         self.assertTrue(any(value != 0 for value in capture.pcm16))
         capture.clear()
         self.assertTrue(all(value == 0 for value in capture.pcm16))
+
+        class ZeroPacketProcess(FakeProcess):
+            def communicate(self, timeout: float):
+                del timeout
+                self.returncode = 0
+                result = {
+                    "schema_version": "voice_capture_dsp_aec_observation.v0",
+                    "result_class": "processed_near_end_silence_observed",
+                    "observation": {
+                        "packet_count": 0,
+                        "processed_byte_count": 0,
+                    },
+                }
+                return json.dumps(result).encode("utf-8"), b""
+
+        class ZeroPacketServer(FakeServer):
+            def finish(self, *, timeout_seconds: float):
+                del timeout_seconds
+                self.result_pcm = bytearray()
+                return {"pcm16": self.result_pcm, "packet_count": 0}
+
+        with (
+            mock.patch("src.io.aec_reference._resolve_powershell_executable", return_value="pwsh"),
+            mock.patch("src.io.aec_reference._current_process_creation_utc_ticks", return_value=123),
+            mock.patch("src.io.aec_reference._utc_now_dotnet_ticks", return_value=456),
+        ):
+            with self.assertRaisesRegex(
+                LiveAecCaptureError,
+                "^live_aec_processed_packet_invalid$",
+            ):
+                capture_live_aec_processed_pcm(
+                    owner_selection=selection,
+                    window_ms=100,
+                    deadline_ms=1000,
+                    helper_path=helper_path,
+                    popen_factory=ZeroPacketProcess,
+                    server_factory=ZeroPacketServer,
+                )
+        zero_packet_server = created_servers[-1]
+        self.assertEqual(zero_packet_server.close_count, 1)
+
+        with self.assertRaisesRegex(
+            LiveAecCaptureError,
+            "^live_aec_processing_mode_invalid$",
+        ):
+            capture_live_aec_processed_pcm(
+                owner_selection=selection,
+                window_ms=100,
+                deadline_ms=1000,
+                processing_mode_class="caller_selected_user_intent",
+            )
 
         helper_observation.update(packet_count=2, processed_byte_count=640)
         with (
@@ -3510,9 +3644,16 @@ class SmokeTests(unittest.TestCase):
         for state in ("handoff_accepted", "cooldown"):
             with self.subTest(lifecycle_state=state):
                 gate = InputGate()
-                gate.observe_system_speech_lifecycle(
-                    build_system_speech_lifecycle(state)
+                observe_gate_lifecycle(
+                    gate,
+                    build_system_speech_lifecycle("handoff_accepted"),
                 )
+                if state == "cooldown":
+                    observe_gate_lifecycle(
+                        gate,
+                        build_system_speech_lifecycle("cooldown"),
+                        wall_timestamp="2026-07-13T12:00:01.000Z",
+                    )
                 gate.observe_self_output_observation(
                     build_self_output_observation()
                 )
@@ -3526,7 +3667,16 @@ class SmokeTests(unittest.TestCase):
         self.assertIsNone(
             missing.issue_turn_input_capability(build_user_speech_candidate())
         )
-        missing.observe_system_speech_lifecycle(build_system_speech_lifecycle())
+        for state, wall_timestamp in (
+            ("handoff_accepted", "2026-07-13T12:00:00.000Z"),
+            ("cooldown", "2026-07-13T12:00:01.000Z"),
+            ("released", "2026-07-13T12:00:02.000Z"),
+        ):
+            observe_gate_lifecycle(
+                missing,
+                build_system_speech_lifecycle(state),
+                wall_timestamp=wall_timestamp,
+            )
         self.assertIsNone(
             missing.issue_turn_input_capability(build_user_speech_candidate())
         )
@@ -3546,7 +3696,8 @@ class SmokeTests(unittest.TestCase):
         gate = prepare_current_input_gate()
         candidate = build_user_speech_candidate()
         capability = gate.issue_turn_input_capability(candidate)
-        gate.observe_system_speech_lifecycle(
+        observe_gate_lifecycle(
+            gate,
             build_system_speech_lifecycle(
                 "handoff_accepted",
                 generation=8,
@@ -3556,7 +3707,9 @@ class SmokeTests(unittest.TestCase):
                 playback_ref=(
                     "playback-event:pe_ffffffffffffffffffffffffffffffff"
                 ),
-            )
+            ),
+            turn_id="web_ffffffffffffffffffffffffffffffff",
+            wall_timestamp="2026-07-13T12:01:00.000Z",
         )
         self.assertFalse(gate.consume_turn_input_capability(capability, candidate))
         self.assertFalse(gate.consume_turn_input_capability(capability, candidate))
@@ -3699,26 +3852,41 @@ class SmokeTests(unittest.TestCase):
         app.config[ENABLE_PROCESS_SHUTDOWN_CONFIG] = False
         client = app.test_client()
         headers = {"X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]}
-        for event_name, payload in (
-            (
-                "swordAgentSystemSpeechLifecycleV0",
-                build_system_speech_lifecycle(),
-            ),
-            (
-                "audioSelfOutputObservationV0",
-                build_self_output_observation(),
-            ),
+        for index, state in enumerate(
+            ("handoff_accepted", "cooldown", "released")
         ):
             response = client.post(
                 "/api/events/ingest",
                 headers=headers,
-                json={"event": event_name, "payload": payload},
+                json={
+                    "event": "swordAgentSystemSpeechLifecycleV0",
+                    "turn_id": "web_abcdef0123456789abcdef0123456789",
+                    "source": "self-output-awareness-controller",
+                    "payload": build_system_speech_lifecycle(state),
+                    "client_timestamp_wall": (
+                        f"2026-07-13T12:00:0{index}.000Z"
+                    ),
+                    "client_timestamp_monotonic": 12.5 + index,
+                    "client_performance_now": 12_500.0 + index,
+                },
             )
             self.assertEqual(response.status_code, 202)
             response_text = response.get_data(as_text=True)
             self.assertNotIn(SYSTEM_SPEECH_SESSION_ID, response_text)
             self.assertNotIn(PLAYBACK_EVENT_REF, response_text)
             self.assertNotIn("capability", response_text)
+        response = client.post(
+            "/api/events/ingest",
+            headers=headers,
+            json={
+                "event": "audioSelfOutputObservationV0",
+                "payload": build_self_output_observation(),
+            },
+        )
+        self.assertEqual(response.status_code, 202)
+        self.assertNotIn(SYSTEM_SPEECH_SESSION_ID, response.get_data(as_text=True))
+        self.assertNotIn(PLAYBACK_EVENT_REF, response.get_data(as_text=True))
+        self.assertNotIn("capability", response.get_data(as_text=True))
 
         response = client.post(
             "/api/input-gate",
@@ -3745,6 +3913,96 @@ class SmokeTests(unittest.TestCase):
             self.assertEqual(status.status_code, 200)
             self.assertNotIn("capability", status.get_data(as_text=True))
             self.assertNotIn("candidate_id", status.get_data(as_text=True))
+
+    def test_http_lifecycle_intake_forwards_validated_transport_context(self) -> None:
+        """Core restart ordering uses only the validated controller envelope."""
+        app = create_app()
+        app.config[ENABLE_PROCESS_SHUTDOWN_CONFIG] = False
+        client = app.test_client()
+        headers = {"X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]}
+        turn_id = "web_abcdef0123456789abcdef0123456789"
+        wall = "2026-07-13T12:00:00.000Z"
+        with mock.patch.object(
+            InputGate,
+            "observe_system_speech_lifecycle",
+            autospec=True,
+        ) as observe:
+            missing_timing = client.post(
+                "/api/events/ingest",
+                headers=headers,
+                json={
+                    "event": "swordAgentSystemSpeechLifecycleV0",
+                    "turn_id": turn_id,
+                    "source": "self-output-awareness-controller",
+                    "payload": build_system_speech_lifecycle(
+                        "handoff_accepted"
+                    ),
+                },
+            )
+            self.assertEqual(missing_timing.status_code, 400)
+            self.assertEqual(observe.call_count, 0)
+            complete_handoff = {
+                "event": "swordAgentSystemSpeechLifecycleV0",
+                "turn_id": turn_id,
+                "source": "self-output-awareness-controller",
+                "payload": build_system_speech_lifecycle(
+                    "handoff_accepted"
+                ),
+                "client_timestamp_wall": wall,
+                "client_timestamp_monotonic": 12.5,
+                "client_performance_now": 12_500.0,
+            }
+            for missing_field in ("source", "turn_id"):
+                with self.subTest(missing_transport_field=missing_field):
+                    incomplete_handoff = dict(complete_handoff)
+                    del incomplete_handoff[missing_field]
+                    rejected = client.post(
+                        "/api/events/ingest",
+                        headers=headers,
+                        json=incomplete_handoff,
+                    )
+                    self.assertEqual(rejected.status_code, 400)
+                    self.assertEqual(observe.call_count, 0)
+            response = client.post(
+                "/api/events/ingest",
+                headers=headers,
+                json={
+                    "event": "swordAgentSystemSpeechLifecycleV0",
+                    "turn_id": turn_id,
+                    "source": "self-output-awareness-controller",
+                    "payload": build_system_speech_lifecycle(
+                        "handoff_accepted"
+                    ),
+                    "client_timestamp_wall": wall,
+                    "client_timestamp_monotonic": 12.5,
+                    "client_performance_now": 12_500.0,
+                },
+            )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(observe.call_count, 1)
+        self.assertEqual(
+            observe.call_args.kwargs,
+            {
+                "transport_source": "self-output-awareness-controller",
+                "transport_turn_id": turn_id,
+                "transport_wall_timestamp": wall,
+            },
+        )
+
+        rejected_initial_released = client.post(
+            "/api/events/ingest",
+            headers=headers,
+            json={
+                "event": "swordAgentSystemSpeechLifecycleV0",
+                "turn_id": "web_11111111111111111111111111111111",
+                "source": "self-output-awareness-controller",
+                "payload": build_system_speech_lifecycle("released"),
+                "client_timestamp_wall": "2026-07-13T12:01:00.000Z",
+                "client_timestamp_monotonic": 13.5,
+                "client_performance_now": 13_500.0,
+            },
+        )
+        self.assertEqual(rejected_initial_released.status_code, 400)
 
     def test_web_event_and_gate_fields_never_echo_private_markers(self) -> None:
         """Strict event/gate parsing should reject or classify every marker."""
@@ -3820,7 +4078,7 @@ class SmokeTests(unittest.TestCase):
                 body["payload"][field] = marker
                 assert_rejected(body)
 
-        lifecycle = build_system_speech_lifecycle()
+        lifecycle = build_system_speech_lifecycle("handoff_accepted")
         for field in lifecycle:
             with self.subTest(lifecycle_field=field):
                 mutated = dict(lifecycle)
@@ -3836,7 +4094,10 @@ class SmokeTests(unittest.TestCase):
             headers=headers,
             json={
                 "event": "swordAgentSystemSpeechLifecycleV0",
+                "turn_id": "web_abcdef0123456789abcdef0123456789",
+                "source": "self-output-awareness-controller",
                 "payload": lifecycle,
+                **valid_timing,
             },
         )
         self.assertEqual(accepted_lifecycle.status_code, 202)
@@ -4871,11 +5132,270 @@ class SmokeTests(unittest.TestCase):
             observed["owner_selection"],
             get_adopted_live_aec_owner_selection(),
         )
+        self.assertEqual(
+            observed["processing_mode_class"],
+            LIVE_CAPTURE_MODE_AEC,
+        )
         self.assertEqual(window.packet_count, 1)
         self.assertEqual(window.processed_byte_count, 320)
         self.assertEqual(repr(window), "<live-microphone-candidate-window private-pcm>")
         window.clear()
         self.assertEqual(pcm, bytearray(len(pcm)))
+
+    def test_live_capture_mode_follows_only_gate_owned_lifecycle(self) -> None:
+        """AEC is conservative; released joined input uses no-render NS/AGC."""
+        gate = InputGate()
+        self.assertEqual(
+            LIVE_CAPTURE_MODE_AEC,
+            aec_reference_module.LIVE_CAPTURE_MODE_AEC,
+        )
+        self.assertEqual(
+            LIVE_CAPTURE_MODE_NS_AGC,
+            aec_reference_module.LIVE_CAPTURE_MODE_NS_AGC,
+        )
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("handoff_accepted"),
+        )
+        gate.observe_self_output_observation(build_self_output_observation())
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("cooldown"),
+            wall_timestamp="2026-07-13T12:00:01.000Z",
+        )
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("released"),
+            wall_timestamp="2026-07-13T12:00:02.000Z",
+        )
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_NS_AGC,
+        )
+
+        next_session_id = (
+            "system-speech-session:sss_dddddddddddddddddddddddddddddddd"
+        )
+        next_playback_ref = (
+            "playback-event:pe_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        )
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle(
+                "handoff_accepted",
+                generation=8,
+                session_id=next_session_id,
+                playback_ref=next_playback_ref,
+            ),
+            turn_id="web_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            wall_timestamp="2026-07-13T12:01:00.000Z",
+        )
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle(
+                "cooldown",
+                generation=8,
+                session_id=next_session_id,
+                playback_ref=next_playback_ref,
+            ),
+            turn_id="web_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            wall_timestamp="2026-07-13T12:01:01.000Z",
+        )
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle(
+                "released",
+                generation=8,
+                session_id=next_session_id,
+                playback_ref=next_playback_ref,
+            ),
+            turn_id="web_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            wall_timestamp="2026-07-13T12:01:02.000Z",
+        )
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+        gate.observe_self_output_observation(
+            build_self_output_observation(
+                generation=8,
+                session_id=next_session_id,
+                playback_ref=next_playback_ref,
+            )
+        )
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_NS_AGC,
+        )
+
+    def test_lower_generation_restart_requires_new_ordered_transport_join(
+        self,
+    ) -> None:
+        """A trusted page reload invalidates the old join before mode changes."""
+        missing_context_gate = InputGate()
+        with self.assertRaisesRegex(InputGateError, "requires trusted handoff"):
+            missing_context_gate.observe_system_speech_lifecycle(
+                build_system_speech_lifecycle("handoff_accepted")
+            )
+        self.assertEqual(
+            missing_context_gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+        initial_released_gate = InputGate()
+        with self.assertRaisesRegex(InputGateError, "requires trusted handoff"):
+            observe_gate_lifecycle(
+                initial_released_gate,
+                build_system_speech_lifecycle("released"),
+            )
+        self.assertEqual(
+            initial_released_gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+
+        gate = InputGate()
+        first_context = {
+            "transport_source": "self-output-awareness-controller",
+            "transport_turn_id": "web_11111111111111111111111111111111",
+            "transport_wall_timestamp": "2026-07-13T12:00:00.000Z",
+        }
+        for state, timestamp in (
+            ("handoff_accepted", "2026-07-13T12:00:00.000Z"),
+            ("cooldown", "2026-07-13T12:00:01.000Z"),
+            ("released", "2026-07-13T12:00:02.000Z"),
+        ):
+            gate.observe_system_speech_lifecycle(
+                build_system_speech_lifecycle(state),
+                **{
+                    **first_context,
+                    "transport_wall_timestamp": timestamp,
+                },
+            )
+        gate.observe_self_output_observation(build_self_output_observation())
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_NS_AGC,
+        )
+
+        restarted_session_id = (
+            "system-speech-session:sss_44444444444444444444444444444444"
+        )
+        restarted_playback_ref = (
+            "playback-event:pe_55555555555555555555555555555555"
+        )
+        restarted_handoff = build_system_speech_lifecycle(
+            "handoff_accepted",
+            generation=1,
+            session_id=restarted_session_id,
+            playback_ref=restarted_playback_ref,
+        )
+        with self.assertRaisesRegex(InputGateError, "lifecycle is stale"):
+            gate.observe_system_speech_lifecycle(restarted_handoff)
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+
+        with self.assertRaisesRegex(InputGateError, "lifecycle is stale"):
+            gate.observe_system_speech_lifecycle(
+                restarted_handoff,
+                transport_source="self-output-awareness-controller",
+                transport_turn_id="web_11111111111111111111111111111111",
+                transport_wall_timestamp="2026-07-13T12:00:03.000Z",
+            )
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+        with self.assertRaisesRegex(InputGateError, "lifecycle is stale"):
+            gate.observe_system_speech_lifecycle(
+                restarted_handoff,
+                transport_source="self-output-awareness-controller",
+                transport_turn_id="web_99999999999999999999999999999999",
+                transport_wall_timestamp="2026-07-13T12:00:02.000Z",
+            )
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+
+        restart_context = {
+            "transport_source": "self-output-awareness-controller",
+            "transport_turn_id": "web_22222222222222222222222222222222",
+            "transport_wall_timestamp": "2026-07-13T12:01:00.000Z",
+        }
+        gate.observe_system_speech_lifecycle(
+            restarted_handoff,
+            **restart_context,
+        )
+        with self.assertRaisesRegex(InputGateError, "does not match"):
+            gate.observe_self_output_observation(build_self_output_observation())
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+        for state, timestamp in (
+            ("cooldown", "2026-07-13T12:01:01.000Z"),
+            ("released", "2026-07-13T12:01:02.000Z"),
+        ):
+            gate.observe_system_speech_lifecycle(
+                build_system_speech_lifecycle(
+                    state,
+                    generation=1,
+                    session_id=restarted_session_id,
+                    playback_ref=restarted_playback_ref,
+                ),
+                **{
+                    **restart_context,
+                    "transport_wall_timestamp": timestamp,
+                },
+            )
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+        gate.observe_self_output_observation(
+            build_self_output_observation(
+                generation=1,
+                session_id=restarted_session_id,
+                playback_ref=restarted_playback_ref,
+            )
+        )
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_NS_AGC,
+        )
+
+        with self.assertRaisesRegex(InputGateError, "must start at handoff"):
+            gate.observe_system_speech_lifecycle(
+                build_system_speech_lifecycle("handoff_accepted"),
+                transport_source="self-output-awareness-controller",
+                transport_turn_id="web_33333333333333333333333333333333",
+                transport_wall_timestamp="2026-07-13T12:02:00.000Z",
+            )
+        self.assertEqual(
+            gate.live_capture_processing_mode_class(),
+            LIVE_CAPTURE_MODE_AEC,
+        )
 
     def test_consumed_candidate_audit_requires_exact_private_identity(self) -> None:
         """A same-value candidate copy must not inherit a consumed capability."""
@@ -4970,18 +5490,7 @@ class SmokeTests(unittest.TestCase):
         app.config[ENABLE_PROCESS_SHUTDOWN_CONFIG] = False
         client = app.test_client()
         headers = {"X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]}
-        for event_name, payload in (
-            ("swordAgentSystemSpeechLifecycleV0", build_system_speech_lifecycle()),
-            ("audioSelfOutputObservationV0", build_self_output_observation()),
-        ):
-            self.assertEqual(
-                client.post(
-                    "/api/events/ingest",
-                    headers=headers,
-                    json={"event": event_name, "payload": payload},
-                ).status_code,
-                202,
-            )
+        post_current_lifecycle_events(client, headers)
 
         pcm_values = [bytearray(b"\x01\x00" * 160) for _ in range(2)]
 
@@ -5083,18 +5592,7 @@ class SmokeTests(unittest.TestCase):
         app.config[ENABLE_PROCESS_SHUTDOWN_CONFIG] = False
         client = app.test_client()
         headers = {"X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]}
-        for event_name, payload in (
-            ("swordAgentSystemSpeechLifecycleV0", build_system_speech_lifecycle()),
-            ("audioSelfOutputObservationV0", build_self_output_observation()),
-        ):
-            self.assertEqual(
-                client.post(
-                    "/api/events/ingest",
-                    headers=headers,
-                    json={"event": event_name, "payload": payload},
-                ).status_code,
-                202,
-            )
+        post_current_lifecycle_events(client, headers)
         pcm = bytearray(b"\x21\x00" * 160)
         capture_window = LiveMicrophoneCandidateWindow(
             chunk=AudioChunk(
@@ -5120,7 +5618,7 @@ class SmokeTests(unittest.TestCase):
             mock.patch(
                 "src.web.app.capture_live_microphone_candidate_window",
                 return_value=capture_window,
-            ),
+            ) as capture_mock,
             mock.patch(
                 "src.web.app.has_detectable_speech_pcm16",
                 return_value=True,
@@ -5140,6 +5638,11 @@ class SmokeTests(unittest.TestCase):
                 },
             )
         self.assertEqual(response.status_code, 200)
+        capture_mock.assert_called_once_with(
+            window_ms=100,
+            deadline_ms=1000,
+            processing_mode_class=LIVE_CAPTURE_MODE_NS_AGC,
+        )
         payload = response.get_json()
         self.assertEqual(
             payload["result_class"],
@@ -5208,21 +5711,7 @@ class SmokeTests(unittest.TestCase):
                 headers = {
                     "X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]
                 }
-                for event_name, event_payload in (
-                    (
-                        "swordAgentSystemSpeechLifecycleV0",
-                        build_system_speech_lifecycle(),
-                    ),
-                    (
-                        "audioSelfOutputObservationV0",
-                        build_self_output_observation(),
-                    ),
-                ):
-                    client.post(
-                        "/api/events/ingest",
-                        headers=headers,
-                        json={"event": event_name, "payload": event_payload},
-                    )
+                post_current_lifecycle_events(client, headers)
                 pcm = bytearray(
                     (b"\x00\x02" if not actual_speech else b"\x01\x00")
                     * 160
@@ -5301,6 +5790,7 @@ class SmokeTests(unittest.TestCase):
                     "deadline_ms": 1000,
                     "candidate": marker,
                     "may_materialize_thought_core_turninput": True,
+                    "processing_mode_class": LIVE_CAPTURE_MODE_NS_AGC,
                 },
             )
         self.assertEqual(response.status_code, 400)
@@ -5358,21 +5848,7 @@ class SmokeTests(unittest.TestCase):
                 headers = {
                     "X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]
                 }
-                for event_name, event_payload in (
-                    (
-                        "swordAgentSystemSpeechLifecycleV0",
-                        build_system_speech_lifecycle(),
-                    ),
-                    (
-                        "audioSelfOutputObservationV0",
-                        build_self_output_observation(),
-                    ),
-                ):
-                    client.post(
-                        "/api/events/ingest",
-                        headers=headers,
-                        json={"event": event_name, "payload": event_payload},
-                    )
+                post_current_lifecycle_events(client, headers)
                 pcm = bytearray(b"\x01\x00" * 160)
                 capture_window = LiveMicrophoneCandidateWindow(
                     chunk=AudioChunk(

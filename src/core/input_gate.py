@@ -11,6 +11,10 @@ import threading
 from typing import Any, Mapping
 
 
+LIVE_CAPTURE_MODE_AEC = "windows_voice_capture_dsp_aec"
+LIVE_CAPTURE_MODE_NS_AGC = "windows_voice_capture_dsp_ns_agc"
+
+
 class InputGateError(ValueError):
     """Raised when an input-gate update payload is invalid."""
 
@@ -117,6 +121,13 @@ class _SystemSpeechLifecycleObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class _LifecycleTransportContext:
+    source: str
+    turn_id: str
+    wall_timestamp: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class _SelfOutputObservation:
     self_output_observation_ref: str
     system_speech_session_id: str
@@ -182,6 +193,9 @@ _SELF_OUTPUT_OBSERVATION_PATTERN = re.compile(
     r"^self-output-observation:aso_[a-f0-9]{32}$"
 )
 _PRIVATE_CANDIDATE_PATTERN = re.compile(r"^ausc_live:cid_[a-f0-9]{32}$")
+_LIFECYCLE_TRANSPORT_TURN_PATTERN = re.compile(r"^web_[a-f0-9]{32}$")
+_LIFECYCLE_TRANSPORT_SOURCE = "self-output-awareness-controller"
+_LIFECYCLE_LEASE_HISTORY_LIMIT = 4096
 _GATE_REASON_CLASSES = {
     "capture-only": "capture_only",
     "capture_only": "capture_only",
@@ -265,7 +279,9 @@ class InputGate:
         self._capability_owner = object()
         self._capability_generation = 0
         self._lifecycle: _SystemSpeechLifecycleObservation | None = None
+        self._lifecycle_transport: _LifecycleTransportContext | None = None
         self._self_output: _SelfOutputObservation | None = None
+        self._seen_lifecycle_leases: set[tuple[str, int, str]] = set()
         self._pending: dict[int, _PendingTurnInputCapability] = {}
         self._used_candidate_ids: set[str] = set()
         self._consumed_candidates: dict[str, UserSpeechCandidateEvidence] = {}
@@ -312,26 +328,91 @@ class InputGate:
         """Parse and apply a backend-neutral input-gate payload."""
         return self.update(parse_input_gate_payload(payload))
 
-    def observe_system_speech_lifecycle(self, payload: Mapping[str, Any]) -> None:
+    def observe_system_speech_lifecycle(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        transport_source: str | None = None,
+        transport_turn_id: str | None = None,
+        transport_wall_timestamp: str | None = None,
+    ) -> None:
         """Ingest one bounded AIT lifecycle observation without granting authority."""
         observation = _parse_system_speech_lifecycle(payload)
+        transport = _parse_lifecycle_transport_context(
+            source=transport_source,
+            turn_id=transport_turn_id,
+            wall_timestamp=transport_wall_timestamp,
+        )
         with self._lock:
             current = self._lifecycle
+            current_transport = self._lifecycle_transport
+            lease_key = _lifecycle_lease_key(observation)
             if current is not None:
-                if observation.speech_session_generation < current.speech_session_generation:
-                    raise InputGateError("system speech lifecycle is stale")
-                if observation.speech_session_generation == current.speech_session_generation:
+                same_lease = lease_key == _lifecycle_lease_key(current)
+                if observation.lifecycle_state == "handoff_accepted" and (
+                    not same_lease or current.lifecycle_state == "released"
+                ):
+                    self._invalidate_join_for_system_speech_locked()
+                if (
+                    observation.speech_session_generation
+                    <= current.speech_session_generation
+                    and not same_lease
+                ):
+                    if not _is_trusted_lifecycle_restart(
+                        current=current,
+                        current_transport=current_transport,
+                        next_observation=observation,
+                        next_transport=transport,
+                        seen_leases=self._seen_lifecycle_leases,
+                    ):
+                        raise InputGateError("system speech lifecycle is stale")
+                elif observation.speech_session_generation == current.speech_session_generation:
                     if (
-                        observation.system_speech_session_id
-                        != current.system_speech_session_id
-                        or observation.playback_event_ref != current.playback_event_ref
+                        not same_lease
                         or observation.lifecycle_state
                         not in _LIFECYCLE_TRANSITIONS[current.lifecycle_state]
+                        or not _same_lifecycle_transport(
+                            current_transport,
+                            transport,
+                        )
                     ):
                         raise InputGateError("system speech lifecycle changed incompatibly")
-                elif observation.lifecycle_state != "handoff_accepted":
-                    raise InputGateError("new system speech generation must start at handoff")
+                elif observation.speech_session_generation > current.speech_session_generation:
+                    if (
+                        observation.lifecycle_state != "handoff_accepted"
+                        or lease_key in self._seen_lifecycle_leases
+                        or not _newer_lifecycle_transport(
+                            current_transport,
+                            transport,
+                        )
+                    ):
+                        raise InputGateError(
+                            "new system speech generation must start at handoff"
+                        )
+            elif (
+                observation.lifecycle_state != "handoff_accepted"
+                or transport is None
+            ):
+                raise InputGateError(
+                    "initial system speech lifecycle requires trusted handoff"
+                )
+            if (
+                observation.lifecycle_state == "handoff_accepted"
+                and lease_key not in self._seen_lifecycle_leases
+            ):
+                if len(self._seen_lifecycle_leases) >= _LIFECYCLE_LEASE_HISTORY_LIMIT:
+                    raise InputGateError("system speech lifecycle history is full")
+                self._seen_lifecycle_leases.add(lease_key)
             self._lifecycle = observation
+            self._lifecycle_transport = transport
+
+    def _invalidate_join_for_system_speech_locked(self) -> None:
+        """Fail closed before validating a new or replayed speech handoff."""
+        self._self_output = None
+        for pending in self._pending.values():
+            self._used_candidate_ids.add(pending.candidate.candidate_id)
+        self._pending.clear()
+        self._consumed_candidates.clear()
 
     def observe_self_output_observation(self, payload: Mapping[str, Any]) -> None:
         """Ingest one bounded process-observer correlation without granting authority."""
@@ -464,6 +545,20 @@ class InputGate:
         """Return a class-only count of pending or retained private authority."""
         with self._lock:
             return len(self._pending) + len(self._consumed_candidates)
+
+    def live_capture_processing_mode_class(self) -> str:
+        """Choose signal processing from gate-owned causal state only."""
+        with self._lock:
+            lifecycle = self._lifecycle
+            self_output = self._self_output
+            if (
+                lifecycle is not None
+                and self_output is not None
+                and lifecycle.lifecycle_state == "released"
+                and _same_observation_context(lifecycle, self_output)
+            ):
+                return LIVE_CAPTURE_MODE_NS_AGC
+            return LIVE_CAPTURE_MODE_AEC
 
     def evaluate_live_processed_candidate(
         self,
@@ -837,6 +932,97 @@ def _parse_self_output_observation(
             _PLAYBACK_EVENT_PATTERN,
             "playback_event_ref",
         ),
+    )
+
+
+def _parse_lifecycle_transport_context(
+    *,
+    source: str | None,
+    turn_id: str | None,
+    wall_timestamp: str | None,
+) -> _LifecycleTransportContext | None:
+    values = (source, turn_id, wall_timestamp)
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise InputGateError("system speech transport context is incomplete")
+    if source != _LIFECYCLE_TRANSPORT_SOURCE:
+        raise InputGateError("system speech transport source is invalid")
+    if (
+        not isinstance(turn_id, str)
+        or _LIFECYCLE_TRANSPORT_TURN_PATTERN.fullmatch(turn_id) is None
+    ):
+        raise InputGateError("system speech transport turn is invalid")
+    if not isinstance(wall_timestamp, str):
+        raise InputGateError("system speech transport timestamp is invalid")
+    try:
+        parsed_wall = datetime.fromisoformat(wall_timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        raise InputGateError("system speech transport timestamp is invalid") from None
+    if parsed_wall.tzinfo != UTC or not 2020 <= parsed_wall.year <= 2100:
+        raise InputGateError("system speech transport timestamp is invalid")
+    return _LifecycleTransportContext(
+        source=source,
+        turn_id=turn_id,
+        wall_timestamp=parsed_wall,
+    )
+
+
+def _lifecycle_lease_key(
+    observation: _SystemSpeechLifecycleObservation,
+) -> tuple[str, int, str]:
+    return (
+        observation.system_speech_session_id,
+        observation.speech_session_generation,
+        observation.playback_event_ref,
+    )
+
+
+def _same_lifecycle_transport(
+    current: _LifecycleTransportContext | None,
+    next_context: _LifecycleTransportContext | None,
+) -> bool:
+    if current is None or next_context is None:
+        return current is None and next_context is None
+    return (
+        current.source == next_context.source
+        and current.turn_id == next_context.turn_id
+        and next_context.wall_timestamp >= current.wall_timestamp
+    )
+
+
+def _newer_lifecycle_transport(
+    current: _LifecycleTransportContext | None,
+    next_context: _LifecycleTransportContext | None,
+) -> bool:
+    if current is None or next_context is None:
+        return current is None and next_context is None
+    return (
+        current.source == next_context.source
+        and next_context.wall_timestamp > current.wall_timestamp
+    )
+
+
+def _is_trusted_lifecycle_restart(
+    *,
+    current: _SystemSpeechLifecycleObservation,
+    current_transport: _LifecycleTransportContext | None,
+    next_observation: _SystemSpeechLifecycleObservation,
+    next_transport: _LifecycleTransportContext | None,
+    seen_leases: set[tuple[str, int, str]],
+) -> bool:
+    if current_transport is None or next_transport is None:
+        return False
+    return (
+        current.lifecycle_state == "released"
+        and next_observation.lifecycle_state == "handoff_accepted"
+        and next_observation.system_speech_session_id
+        != current.system_speech_session_id
+        and next_observation.playback_event_ref != current.playback_event_ref
+        and _lifecycle_lease_key(next_observation) not in seen_leases
+        and current_transport.source == next_transport.source
+        and current_transport.turn_id != next_transport.turn_id
+        and next_transport.wall_timestamp > current_transport.wall_timestamp
     )
 
 

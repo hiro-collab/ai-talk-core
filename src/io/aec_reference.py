@@ -37,6 +37,11 @@ _MAX_VECTOR_LENGTH = 48_000
 _EPSILON = 1e-9
 LIVE_AEC_OWNER_CLASS = "windows_voice_capture_dsp"
 LIVE_AEC_SELECTION_CLASS = "synthetic_aec_owner_selected"
+LIVE_CAPTURE_MODE_AEC = "windows_voice_capture_dsp_aec"
+LIVE_CAPTURE_MODE_NS_AGC = "windows_voice_capture_dsp_ns_agc"
+LIVE_CAPTURE_MODE_CLASSES = frozenset(
+    {LIVE_CAPTURE_MODE_AEC, LIVE_CAPTURE_MODE_NS_AGC}
+)
 LIVE_AEC_FRAME_BYTES = 320
 LIVE_AEC_SAMPLE_RATE = 16_000
 LIVE_AEC_MAX_CAPTURE_BYTES = LIVE_AEC_SAMPLE_RATE * 2 * 5
@@ -54,6 +59,7 @@ LIVE_AEC_FIXED_CHILD_FAILURE_CLASSES = frozenset(
         "processed_pcm_pipe_write_failed",
         "live_aec_backend_or_sink_missing",
         "live_aec_bounds_invalid",
+        "live_aec_processing_mode_invalid",
         "live_aec_processed_packet_invalid",
         "live_aec_deadline_exceeded",
         "live_aec_cleanup_failed",
@@ -166,6 +172,7 @@ def capture_live_aec_processed_pcm(
     owner_selection: Mapping[str, Any] | None,
     window_ms: int,
     deadline_ms: int,
+    processing_mode_class: str = LIVE_CAPTURE_MODE_AEC,
     helper_path: Path | None = None,
     popen_factory: Any = subprocess.Popen,
     server_factory: Any = None,
@@ -173,6 +180,8 @@ def capture_live_aec_processed_pcm(
     """Capture one bounded processed-PCM window through a private pipe lease."""
 
     validated = validate_live_aec_owner_selection(owner_selection)
+    if processing_mode_class not in LIVE_CAPTURE_MODE_CLASSES:
+        raise LiveAecCaptureError("live_aec_processing_mode_invalid")
     if window_ms < 100 or window_ms > 5000:
         raise LiveAecCaptureError("live_aec_bounds_invalid")
     if deadline_ms < window_ms + 200 or deadline_ms > 10_000:
@@ -218,6 +227,7 @@ def capture_live_aec_processed_pcm(
                 server_creation_utc_ticks=server_creation_ticks,
                 expires_utc_ticks=expires_ticks,
                 selection=validated,
+                processing_mode_class=processing_mode_class,
             )
         )
         command = [
@@ -279,6 +289,9 @@ def capture_live_aec_processed_pcm(
             or len(server_pcm) != raw_packet_count * LIVE_AEC_FRAME_BYTES
         ):
             raise LiveAecCaptureError("live_aec_pipe_result_invalid")
+        if raw_packet_count == 0:
+            _clear_bytearray(server_pcm)
+            raise LiveAecCaptureError("live_aec_processed_packet_invalid")
         pcm16 = server_pcm
         packet_count = raw_packet_count
         helper_packet_count = helper_result["observation"]["packet_count"]
@@ -353,6 +366,7 @@ def _encode_private_lease_packet(
     server_creation_utc_ticks: int,
     expires_utc_ticks: int,
     selection: Mapping[str, object],
+    processing_mode_class: str,
 ) -> bytes:
     packet = {
         "pipe_name": pipe_name,
@@ -362,6 +376,7 @@ def _encode_private_lease_packet(
         "expires_utc_ticks": expires_utc_ticks,
         "aec_owner_selection_class": selection["result_class"],
         "selected_owner_class": selection["selected_owner_class"],
+        "processing_mode_class": processing_mode_class,
     }
     return json.dumps(packet, separators=(",", ":")).encode("utf-8")
 
