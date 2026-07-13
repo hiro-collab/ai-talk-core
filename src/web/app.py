@@ -58,6 +58,7 @@ from src.io.microphone import (
     LiveMicrophoneCandidateWindow,
     capture_live_microphone_candidate_window,
     classify_live_pcm16_signal,
+    find_last_vad_speech_frame_offset_ms,
     has_detectable_speech_pcm16,
 )
 from src.web.transcription_service import (
@@ -694,6 +695,9 @@ def build_live_candidate_window_response(
     submission_count: int = 0,
     thought_core_turninput_count: int = 0,
     elapsed_ms: int = 0,
+    last_vad_speech_frame_offset_ms: int | None = None,
+    utterance_end_to_candidate_result_ms: int | None = None,
+    utterance_end_timing_class: str = "not_evaluated",
     pcm_cleanup_count: int = 0,
     private_authority_residue_count: int = 0,
 ) -> dict[str, object]:
@@ -710,6 +714,11 @@ def build_live_candidate_window_response(
         "submission_count": submission_count,
         "thought_core_turninput_count": thought_core_turninput_count,
         "elapsed_ms": elapsed_ms,
+        "last_vad_speech_frame_offset_ms": last_vad_speech_frame_offset_ms,
+        "utterance_end_to_candidate_result_ms": (
+            utterance_end_to_candidate_result_ms
+        ),
+        "utterance_end_timing_class": utterance_end_timing_class,
         "pcm_cleanup_count": pcm_cleanup_count,
         "private_authority_residue_count": private_authority_residue_count,
         "raw_private_publication_flags": False,
@@ -735,6 +744,9 @@ def execute_live_candidate_window(
     transcription_count = 0
     submission_count = 0
     turninput_count = 0
+    last_vad_speech_frame_offset_ms: int | None = None
+    utterance_end_to_candidate_result_ms: int | None = None
+    utterance_end_timing_class = "not_evaluated"
     result_class = "live_candidate_window_failed"
     expectation_class = "not_evaluated"
     session: MicLoopSession | None = None
@@ -758,6 +770,17 @@ def execute_live_candidate_window(
             raise AudioInputError("live candidate PCM is unavailable")
         signal_class = classify_live_pcm16_signal(pcm16)
         has_speech = has_detectable_speech_pcm16(pcm16)
+        if has_speech:
+            last_vad_speech_frame_offset_ms = (
+                find_last_vad_speech_frame_offset_ms(pcm16)
+            )
+            utterance_end_timing_class = (
+                "vad_speech_frame_available"
+                if last_vad_speech_frame_offset_ms is not None
+                else "vad_speech_frame_inconsistent"
+            )
+        else:
+            utterance_end_timing_class = "no_vad_speech_frame"
         vad_decision_class = (
             "speech_detected" if has_speech else "speech_not_detected"
         )
@@ -869,6 +892,11 @@ def execute_live_candidate_window(
             20_000,
             max(0, int((time.monotonic() - started) * 1000)),
         )
+        if last_vad_speech_frame_offset_ms is not None:
+            utterance_end_to_candidate_result_ms = max(
+                0,
+                elapsed_ms - last_vad_speech_frame_offset_ms,
+            )
     return build_live_candidate_window_response(
         result_class=result_class,
         expectation_class=expectation_class,
@@ -880,6 +908,11 @@ def execute_live_candidate_window(
         submission_count=submission_count,
         thought_core_turninput_count=turninput_count,
         elapsed_ms=elapsed_ms,
+        last_vad_speech_frame_offset_ms=last_vad_speech_frame_offset_ms,
+        utterance_end_to_candidate_result_ms=(
+            utterance_end_to_candidate_result_ms
+        ),
+        utterance_end_timing_class=utterance_end_timing_class,
         pcm_cleanup_count=pcm_cleanup_count,
         private_authority_residue_count=private_authority_residue_count,
     )

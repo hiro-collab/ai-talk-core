@@ -103,6 +103,7 @@ from src.io.microphone import (
     capture_live_microphone_candidate_window,
     capture_microphone_chunk,
     classify_live_pcm16_signal,
+    find_last_vad_speech_frame_offset_ms,
     get_microphone_runtime_status,
     get_recording_timeout_seconds,
     has_detectable_speech_pcm16,
@@ -5114,6 +5115,34 @@ class SmokeTests(unittest.TestCase):
         )
         self.assertTrue(any(value != 0 for value in pcm))
 
+    def test_live_pcm_vad_reports_last_speech_frame_without_authority(self) -> None:
+        """Timing scans all frames and retains no mutable frame copy."""
+        retained_frames: list[bytearray] = []
+        decisions = iter((False, True, False, True, False))
+
+        class FakeVad:
+            def __init__(self, aggressiveness: int) -> None:
+                self.aggressiveness = aggressiveness
+
+            def is_speech(self, frame: bytearray, sample_rate: int) -> bool:
+                self.assertions = (sample_rate, len(frame))
+                retained_frames.append(frame)
+                return next(decisions)
+
+        pcm = bytearray(b"\x01\x00" * (160 * 5))
+        self.assertEqual(
+            find_last_vad_speech_frame_offset_ms(
+                pcm,
+                vad_factory=FakeVad,
+            ),
+            40,
+        )
+        self.assertEqual(len(retained_frames), 5)
+        self.assertTrue(
+            all(all(value == 0 for value in frame) for frame in retained_frames)
+        )
+        self.assertTrue(any(value != 0 for value in pcm))
+
     def test_live_candidate_window_uses_fixed_owner_and_retains_counts(self) -> None:
         """The endpoint capture seam should choose the owner internally."""
         observed: dict[str, object] = {}
@@ -5535,6 +5564,10 @@ class SmokeTests(unittest.TestCase):
                 return_value=True,
             ),
             mock.patch(
+                "src.web.app.find_last_vad_speech_frame_offset_ms",
+                return_value=40,
+            ),
+            mock.patch(
                 "src.web.app.get_cached_transcription_pipeline",
                 side_effect=[RuntimeError(private_marker), pipeline],
             ),
@@ -5624,6 +5657,10 @@ class SmokeTests(unittest.TestCase):
                 return_value=True,
             ),
             mock.patch(
+                "src.web.app.find_last_vad_speech_frame_offset_ms",
+                return_value=40,
+            ),
+            mock.patch(
                 "src.web.app.get_cached_transcription_pipeline",
                 return_value=pipeline,
             ),
@@ -5653,6 +5690,12 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(payload["thought_core_turninput_count"], 1)
         self.assertEqual(payload["signal_class"], "signal_above_floor")
         self.assertEqual(payload["vad_decision_class"], "speech_detected")
+        self.assertEqual(payload["last_vad_speech_frame_offset_ms"], 40)
+        self.assertGreaterEqual(payload["utterance_end_to_candidate_result_ms"], 0)
+        self.assertEqual(
+            payload["utterance_end_timing_class"],
+            "vad_speech_frame_available",
+        )
         self.assertEqual(
             set(payload),
             {
@@ -5667,6 +5710,9 @@ class SmokeTests(unittest.TestCase):
                 "submission_count",
                 "thought_core_turninput_count",
                 "elapsed_ms",
+                "last_vad_speech_frame_offset_ms",
+                "utterance_end_to_candidate_result_ms",
+                "utterance_end_timing_class",
                 "pcm_cleanup_count",
                 "private_authority_residue_count",
                 "raw_private_publication_flags",

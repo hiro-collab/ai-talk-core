@@ -427,6 +427,35 @@ def has_detectable_speech_pcm16(
     return False
 
 
+def find_last_vad_speech_frame_offset_ms(
+    pcm16: bytearray,
+    *,
+    sample_rate: int = 16_000,
+    aggressiveness: int = 2,
+    frame_ms: int = 10,
+    vad_factory: Callable[[int], Any] = WebRtcVadAdapter,
+) -> int | None:
+    """Return the last VAD-positive frame end offset without granting authority."""
+    if not isinstance(pcm16, bytearray):
+        raise AudioInputError("live speech timing requires mutable PCM")
+    validate_vad_aggressiveness(aggressiveness)
+    if sample_rate != 16_000 or frame_ms != 10:
+        raise AudioInputError("live speech timing frame contract is invalid")
+    frame_size = int(sample_rate * frame_ms / 1000) * 2
+    if frame_size != 320 or not pcm16 or len(pcm16) % frame_size != 0:
+        raise AudioInputError("live speech timing PCM bounds are invalid")
+    vad = vad_factory(aggressiveness)
+    last_offset_ms: int | None = None
+    for index in range(0, len(pcm16), frame_size):
+        frame = bytearray(pcm16[index:index + frame_size])
+        try:
+            if vad.is_speech(frame, sample_rate):
+                last_offset_ms = ((index // frame_size) + 1) * frame_ms
+        finally:
+            frame[:] = b"\x00" * len(frame)
+    return last_offset_ms
+
+
 def classify_live_pcm16_signal(
     pcm16: bytearray,
     *,
