@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import wave
 from collections.abc import Mapping
@@ -423,6 +424,42 @@ def has_detectable_speech_pcm16(
         finally:
             frame[:] = b"\x00" * len(frame)
     return False
+
+
+def classify_live_pcm16_signal(
+    pcm16: bytearray,
+    *,
+    sample_rate: int = 16_000,
+    frame_ms: int = 10,
+) -> str:
+    """Return one fixed non-content signal class for mutable live PCM."""
+    if not isinstance(pcm16, bytearray):
+        raise AudioInputError("live signal classification requires mutable PCM")
+    if sample_rate != 16_000 or frame_ms != 10:
+        raise AudioInputError("live signal classification frame contract is invalid")
+    frame_size = int(sample_rate * frame_ms / 1000) * 2
+    if frame_size != 320 or not pcm16 or len(pcm16) % frame_size != 0:
+        raise AudioInputError("live signal classification PCM bounds are invalid")
+
+    sample_count = len(pcm16) // 2
+    square_sum = 0
+    has_nonzero_sample = False
+    for (sample,) in struct.iter_unpack("<h", pcm16):
+        if sample:
+            has_nonzero_sample = True
+        square_sum += sample * sample
+
+    if not has_nonzero_sample:
+        return "all_zero"
+
+    pcm16_full_scale = 1 << 15
+    audio_presence_floor_divisor = 1000
+    if (
+        square_sum * audio_presence_floor_divisor * audio_presence_floor_divisor
+        > sample_count * pcm16_full_scale * pcm16_full_scale
+    ):
+        return "signal_above_floor"
+    return "low_signal"
 
 
 def capture_live_microphone_candidate_window(

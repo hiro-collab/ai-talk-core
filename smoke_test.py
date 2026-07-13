@@ -99,6 +99,7 @@ from src.io.microphone import (
     MICROPHONE_DEVICE_LIST_TIMEOUT_SECONDS,
     capture_live_microphone_candidate_window,
     capture_microphone_chunk,
+    classify_live_pcm16_signal,
     get_microphone_runtime_status,
     get_recording_timeout_seconds,
     has_detectable_speech_pcm16,
@@ -4807,6 +4808,25 @@ class SmokeTests(unittest.TestCase):
                 self.assertEqual(raised.exception.failure_class, expected)
                 self.assertNotIn(private_marker, str(raised.exception))
 
+    def test_live_pcm_signal_class_is_fixed_and_noncontent(self) -> None:
+        """Signal diagnostics should expose only fixed coarse classes."""
+        self.assertEqual(
+            classify_live_pcm16_signal(bytearray(320)),
+            "all_zero",
+        )
+        self.assertEqual(
+            classify_live_pcm16_signal(bytearray(b"\x20\x00" * 160)),
+            "low_signal",
+        )
+        self.assertEqual(
+            classify_live_pcm16_signal(bytearray(b"\x20\x00\x21\x00" * 80)),
+            "low_signal",
+        )
+        self.assertEqual(
+            classify_live_pcm16_signal(bytearray(b"\x21\x00" * 160)),
+            "signal_above_floor",
+        )
+
     def test_live_pcm_vad_clears_mutable_temporary_frames(self) -> None:
         """VAD should retain no immutable or uncleared frame copy."""
         retained_frames: list[bytearray] = []
@@ -5075,7 +5095,7 @@ class SmokeTests(unittest.TestCase):
                 ).status_code,
                 202,
             )
-        pcm = bytearray(b"\x01\x00" * 160)
+        pcm = bytearray(b"\x21\x00" * 160)
         capture_window = LiveMicrophoneCandidateWindow(
             chunk=AudioChunk(
                 path=None,
@@ -5128,6 +5148,35 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(payload["transcription_count"], 1)
         self.assertEqual(payload["submission_count"], 1)
         self.assertEqual(payload["thought_core_turninput_count"], 1)
+        self.assertEqual(payload["signal_class"], "signal_above_floor")
+        self.assertEqual(payload["vad_decision_class"], "speech_detected")
+        self.assertEqual(
+            set(payload),
+            {
+                "schema_version",
+                "result_class",
+                "expectation_class",
+                "capture_packet_count",
+                "capture_byte_count",
+                "signal_class",
+                "vad_decision_class",
+                "transcription_count",
+                "submission_count",
+                "thought_core_turninput_count",
+                "elapsed_ms",
+                "pcm_cleanup_count",
+                "private_authority_residue_count",
+                "raw_private_publication_flags",
+            },
+        )
+        for forbidden_key in (
+            "pcm16",
+            "rms_dbfs",
+            "peak_dbfs",
+            "device_id",
+            "transcript",
+        ):
+            self.assertNotIn(forbidden_key, payload)
         self.assertEqual(payload["pcm_cleanup_count"], 1)
         self.assertEqual(payload["private_authority_residue_count"], 0)
         self.assertEqual(pcm, bytearray(len(pcm)))
@@ -5174,7 +5223,10 @@ class SmokeTests(unittest.TestCase):
                         headers=headers,
                         json={"event": event_name, "payload": event_payload},
                     )
-                pcm = bytearray(b"\x01\x00" * 160)
+                pcm = bytearray(
+                    (b"\x00\x02" if not actual_speech else b"\x01\x00")
+                    * 160
+                )
                 capture_window = LiveMicrophoneCandidateWindow(
                     chunk=AudioChunk(
                         path=None,
@@ -5218,6 +5270,14 @@ class SmokeTests(unittest.TestCase):
                 self.assertEqual(payload["transcription_count"], 0)
                 self.assertEqual(payload["submission_count"], 0)
                 self.assertEqual(payload["thought_core_turninput_count"], 0)
+                self.assertEqual(
+                    payload["signal_class"],
+                    "signal_above_floor" if not actual_speech else "low_signal",
+                )
+                self.assertEqual(
+                    payload["vad_decision_class"],
+                    "speech_detected" if actual_speech else "speech_not_detected",
+                )
                 self.assertEqual(pcm, bytearray(len(pcm)))
                 self.assertEqual(payload["private_authority_residue_count"], 0)
                 sink.assert_not_called()
@@ -5275,6 +5335,8 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(payload["transcription_count"], 0)
         self.assertEqual(payload["submission_count"], 0)
         self.assertEqual(payload["thought_core_turninput_count"], 0)
+        self.assertEqual(payload["signal_class"], "not_evaluated")
+        self.assertEqual(payload["vad_decision_class"], "not_evaluated")
         self.assertEqual(payload["pcm_cleanup_count"], 0)
         self.assertEqual(payload["private_authority_residue_count"], 0)
 

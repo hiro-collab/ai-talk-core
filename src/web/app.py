@@ -57,6 +57,7 @@ from src.io.audio import AudioEnvironmentError, AudioInputError, AudioTranscript
 from src.io.microphone import (
     LiveMicrophoneCandidateWindow,
     capture_live_microphone_candidate_window,
+    classify_live_pcm16_signal,
     has_detectable_speech_pcm16,
 )
 from src.web.transcription_service import (
@@ -672,6 +673,8 @@ def build_live_candidate_window_response(
     expectation_class: str,
     capture_packet_count: int = 0,
     capture_byte_count: int = 0,
+    signal_class: str = "not_evaluated",
+    vad_decision_class: str = "not_evaluated",
     transcription_count: int = 0,
     submission_count: int = 0,
     thought_core_turninput_count: int = 0,
@@ -686,6 +689,8 @@ def build_live_candidate_window_response(
         "expectation_class": expectation_class,
         "capture_packet_count": capture_packet_count,
         "capture_byte_count": capture_byte_count,
+        "signal_class": signal_class,
+        "vad_decision_class": vad_decision_class,
         "transcription_count": transcription_count,
         "submission_count": submission_count,
         "thought_core_turninput_count": thought_core_turninput_count,
@@ -710,6 +715,8 @@ def execute_live_candidate_window(
     transcript = ""
     packet_count = 0
     byte_count = 0
+    signal_class = "not_evaluated"
+    vad_decision_class = "not_evaluated"
     transcription_count = 0
     submission_count = 0
     turninput_count = 0
@@ -731,7 +738,11 @@ def execute_live_candidate_window(
         pcm16 = capture_window.chunk.pcm16
         if pcm16 is None:
             raise AudioInputError("live candidate PCM is unavailable")
+        signal_class = classify_live_pcm16_signal(pcm16)
         has_speech = has_detectable_speech_pcm16(pcm16)
+        vad_decision_class = (
+            "speech_detected" if has_speech else "speech_not_detected"
+        )
         candidate = input_gate.evaluate_live_processed_candidate(
             has_speech=has_speech,
             window_ms=window_ms,
@@ -845,6 +856,8 @@ def execute_live_candidate_window(
         expectation_class=expectation_class,
         capture_packet_count=packet_count,
         capture_byte_count=byte_count,
+        signal_class=signal_class,
+        vad_decision_class=vad_decision_class,
         transcription_count=transcription_count,
         submission_count=submission_count,
         thought_core_turninput_count=turninput_count,
