@@ -40,6 +40,34 @@ LIVE_AEC_SELECTION_CLASS = "synthetic_aec_owner_selected"
 LIVE_AEC_FRAME_BYTES = 320
 LIVE_AEC_SAMPLE_RATE = 16_000
 LIVE_AEC_MAX_CAPTURE_BYTES = LIVE_AEC_SAMPLE_RATE * 2 * 5
+LIVE_AEC_FIXED_CHILD_FAILURE_CLASSES = frozenset(
+    {
+        "processed_pcm_pipe_lease_invalid",
+        "processed_pcm_pipe_owner_unavailable",
+        "processed_pcm_pipe_lease_missing",
+        "processed_pcm_pipe_lease_expired",
+        "processed_pcm_pipe_server_identity_mismatch",
+        "processed_pcm_pipe_private_input_timeout",
+        "processed_pcm_pipe_connect_failed",
+        "processed_pcm_pipe_connect_timeout",
+        "processed_pcm_pipe_handshake_failed",
+        "processed_pcm_pipe_write_failed",
+        "live_aec_backend_or_sink_missing",
+        "live_aec_bounds_invalid",
+        "live_aec_processed_packet_invalid",
+        "live_aec_deadline_exceeded",
+        "live_aec_cleanup_failed",
+        "live_aec_lifecycle_invariant_failed",
+        "voice_capture_dsp_activation_failed",
+        "voice_capture_dsp_configuration_failed",
+        "voice_capture_dsp_output_format_failed",
+        "voice_capture_dsp_start_failed",
+        "voice_capture_dsp_not_started",
+        "voice_capture_dsp_process_output_failed",
+        "voice_capture_dsp_stop_failed",
+        "live_aec_observer_failed",
+    }
+)
 _LIVE_AEC_PIPE_PREFIX = "sword-aec-"
 _LIVE_AEC_ACK = b"\xa1"
 _LIVE_AEC_MAX_LEASE_SECONDS = 15
@@ -113,6 +141,23 @@ def validate_live_aec_owner_selection(
     return {
         "result_class": LIVE_AEC_SELECTION_CLASS,
         "selected_owner_class": LIVE_AEC_OWNER_CLASS,
+    }
+
+
+def get_adopted_live_aec_owner_selection() -> dict[str, object]:
+    """Return the fixed adopted Phase 2 transport selection.
+
+    This selects only the live DSP transport. It grants no candidate,
+    transcription, or TurnInput authority.
+    """
+
+    return {
+        "result_class": LIVE_AEC_SELECTION_CLASS,
+        "selected_owner_class": LIVE_AEC_OWNER_CLASS,
+        "exactly_one_aec_owner": True,
+        "observation_only": False,
+        "raw_audio_persisted": False,
+        "live_audio_used": False,
     }
 
 
@@ -209,6 +254,19 @@ def capture_live_aec_processed_pcm(
             raise LiveAecCaptureError("live_aec_deadline_exceeded") from None
         stdout_bytes.extend(stdout or b"")
         stderr_bytes.extend(stderr or b"")
+        helper_result = _parse_helper_class_only_result(stdout_bytes)
+        helper_result_class = helper_result.get("result_class")
+        if process.returncode != 0:
+            if helper_result_class in LIVE_AEC_FIXED_CHILD_FAILURE_CLASSES:
+                raise LiveAecCaptureError(str(helper_result_class))
+            raise LiveAecCaptureError("live_aec_helper_failed")
+        if helper_result_class in LIVE_AEC_FIXED_CHILD_FAILURE_CLASSES:
+            raise LiveAecCaptureError(str(helper_result_class))
+        if helper_result_class not in {
+            "processed_near_end_pcm_observed",
+            "processed_near_end_silence_observed",
+        }:
+            raise LiveAecCaptureError("live_aec_helper_failed")
         server_result = server.finish(timeout_seconds=1.0)
         server_pcm = server_result.get("pcm16")
         if not isinstance(server_pcm, bytearray):
@@ -221,14 +279,6 @@ def capture_live_aec_processed_pcm(
             or len(server_pcm) != raw_packet_count * LIVE_AEC_FRAME_BYTES
         ):
             raise LiveAecCaptureError("live_aec_pipe_result_invalid")
-        if process.returncode != 0:
-            raise LiveAecCaptureError("live_aec_helper_failed")
-        helper_result = _parse_helper_class_only_result(stdout_bytes)
-        if helper_result.get("result_class") not in {
-            "processed_near_end_pcm_observed",
-            "processed_near_end_silence_observed",
-        }:
-            raise LiveAecCaptureError("live_aec_helper_failed")
         pcm16 = server_pcm
         packet_count = raw_packet_count
         helper_packet_count = helper_result["observation"]["packet_count"]

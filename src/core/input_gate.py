@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import math
 import re
+import secrets
 import threading
 from typing import Any, Mapping
 
@@ -266,6 +268,7 @@ class InputGate:
         self._self_output: _SelfOutputObservation | None = None
         self._pending: dict[int, _PendingTurnInputCapability] = {}
         self._used_candidate_ids: set[str] = set()
+        self._consumed_candidates: dict[str, UserSpeechCandidateEvidence] = {}
 
     @property
     def state(self) -> InputGateState:
@@ -407,7 +410,7 @@ class InputGate:
             self._used_candidate_ids.add(candidate.candidate_id)
             lifecycle = self._lifecycle
             self_output = self._self_output
-            return bool(
+            accepted = bool(
                 lifecycle is not None
                 and self_output is not None
                 and lifecycle == pending.lifecycle
@@ -418,6 +421,286 @@ class InputGate:
                     self_output,
                 )
             )
+            if accepted:
+                self._consumed_candidates[candidate.candidate_id] = candidate
+            return accepted
+
+    def cancel_turn_input_capability(
+        self,
+        capability: object,
+        candidate: object,
+    ) -> bool:
+        """Retire one exact issued-but-unconsumed capability without authority."""
+        if type(capability) is not _TurnInputCapability:
+            return False
+        if type(candidate) is not UserSpeechCandidateEvidence:
+            return False
+        with self._lock:
+            pending = self._pending.get(id(capability))
+            if (
+                pending is None
+                or pending.capability is not capability
+                or pending.candidate is not candidate
+                or capability._owner is not self._capability_owner
+                or capability._generation != pending.capability_generation
+                or capability._candidate_identity is not pending.candidate_identity
+            ):
+                return False
+            del self._pending[id(capability)]
+            self._used_candidate_ids.add(candidate.candidate_id)
+            return True
+
+    def discard_consumed_candidate(self, candidate: object) -> bool:
+        """Drop exact post-consume private evidence without producing an audit."""
+        if type(candidate) is not UserSpeechCandidateEvidence:
+            return False
+        with self._lock:
+            if self._consumed_candidates.get(candidate.candidate_id) is not candidate:
+                return False
+            del self._consumed_candidates[candidate.candidate_id]
+            return True
+
+    def private_authority_residue_count(self) -> int:
+        """Return a class-only count of pending or retained private authority."""
+        with self._lock:
+            return len(self._pending) + len(self._consumed_candidates)
+
+    def evaluate_live_processed_candidate(
+        self,
+        *,
+        has_speech: bool,
+        window_ms: int,
+        packet_count: int,
+        processed_byte_count: int,
+        frame_bytes: int,
+    ) -> UserSpeechCandidateEvidence | None:
+        """Create private candidate evidence from gate-owned current state.
+
+        VAD and AEC facts can establish only a candidate. They do not issue a
+        capability and cannot independently grant TurnInput authority.
+        """
+        if not isinstance(has_speech, bool) or not has_speech:
+            return None
+        with self._lock:
+            lifecycle = self._lifecycle
+            self_output = self._self_output
+            if (
+                not self._state.enabled
+                or lifecycle is None
+                or self_output is None
+                or lifecycle.lifecycle_state != "released"
+                or not _same_observation_context(lifecycle, self_output)
+                or bool(self._pending)
+                or len(self._used_candidate_ids) >= 4096
+            ):
+                return None
+            candidate = UserSpeechCandidateEvidence(
+                candidate_id=f"ausc_live:cid_{secrets.token_hex(16)}",
+                source_kind="user_speech_candidate",
+                near_end_evidence_class="bounded_processed_near_end_candidate",
+                window_ms=window_ms,
+                packet_count=packet_count,
+                processed_byte_count=processed_byte_count,
+                frame_bytes=frame_bytes,
+                storage_class="in_memory_ephemeral",
+                aec_or_vad_turn_input_authority=False,
+                observed_system_speech_session_id=(
+                    lifecycle.system_speech_session_id
+                ),
+                observed_generation=lifecycle.speech_session_generation,
+                active_system_speech_session_id=(
+                    lifecycle.system_speech_session_id
+                ),
+                active_generation=lifecycle.speech_session_generation,
+                playback_event_ref=lifecycle.playback_event_ref,
+                self_output_observation_ref=(
+                    self_output.self_output_observation_ref
+                ),
+                self_output_observation_schema_version=(
+                    "audio_self_output_observation.v0"
+                ),
+                session_join_status="current_match",
+                post_compare_session_status="current_unchanged",
+                self_output_correlation_class="not_self_output",
+                active_session_exclusion_status=(
+                    "explicitly_excluded_from_candidate"
+                ),
+                cooldown_status="clear",
+                opaque_refs_non_dereferenceable=True,
+                decision_owner="ai_talk_core_input_gate",
+                acceptance_status="accepted_user_speech_candidate",
+                may_materialize_thought_core_turninput=True,
+            )
+            if not _candidate_matches_current_join(
+                candidate,
+                lifecycle,
+                self_output,
+            ):
+                return None
+            return candidate
+
+    def build_consumed_candidate_audit(
+        self,
+        candidate: object,
+    ) -> dict[str, object] | None:
+        """Build a canonical text-free audit only after one-use consumption."""
+        if type(candidate) is not UserSpeechCandidateEvidence:
+            return None
+        with self._lock:
+            if self._consumed_candidates.get(candidate.candidate_id) is not candidate:
+                return None
+            del self._consumed_candidates[candidate.candidate_id]
+        candidate_suffix = candidate.candidate_id.rsplit("_", 1)[-1]
+        return {
+            "schema_version": "accepted_user_speech_candidate_input_gate.v0",
+            "candidate_id": candidate.candidate_id,
+            "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "proof_layer": "private_live_input_gate_decision",
+            "route_id": (
+                "A-SELF-OUTPUT-AWARENESS-CANONICAL-INPUT-GATE-SESSION-JOIN-01"
+            ),
+            "candidate_route": "private_user_speech_input_gate",
+            "source_kind": "user_speech_candidate",
+            "speaker_role": "user_candidate",
+            "recognition_summary": {
+                "source_label": "speech.user_candidate_001",
+                "recognition_summary_ref": (
+                    f"user-speech-candidate-summary:rsc_{candidate_suffix}"
+                ),
+                "recognition_summary_class": "redacted_local_offline_candidate",
+                "recognized_text_class": "present_redacted",
+                "recognized_text_length_bucket": "short",
+                "language_bucket": "ja",
+                "confidence_bucket": "unknown",
+                "raw_text_in_shared_artifact": False,
+            },
+            "text_publication": {
+                "text_publication_policy": "text_redacted_or_absent",
+                "text_provenance_class": "redacted_or_absent",
+                "expected_sample_text": None,
+                "recognized_text": None,
+                "content_match_text": None,
+                "non_sample_or_live_text_policy": "protected_or_redacted",
+            },
+            "self_output_context": {
+                "self_output_correlation_class": "not_self_output",
+                "session_join_class": (
+                    "current_active_session_explicitly_excluded"
+                ),
+                "bubble_tts_parity_class": "not_authority_for_user_speech",
+                "bubble_or_tts_as_user_speech_authority": False,
+            },
+            "input_gate": {
+                "input_gate_decision_owner": "ai_talk_core_input_gate",
+                "input_gate_decision_class": "accepted_user_speech_candidate",
+                "normal_turn_block_reason": None,
+            },
+            "acceptance_decision": {
+                "acceptance_status": "accepted_user_speech_candidate",
+                "may_materialize_thought_core_turninput": True,
+                "private_text_handoff_required": True,
+                "shared_artifact_contains_text": False,
+                "thought_core_turninput_materialized": False,
+                "thought_core_turninput_count": 0,
+                "thought_core_turninput_ref": None,
+                "turn_materialization_route": (
+                    "separate_private_runtime_handoff_required"
+                ),
+            },
+            "runtime_session_join": {
+                "near_end_evidence": {
+                    "evidence_class": candidate.near_end_evidence_class,
+                    "window_ms": candidate.window_ms,
+                    "packet_count": candidate.packet_count,
+                    "processed_byte_count": candidate.processed_byte_count,
+                    "frame_bytes": candidate.frame_bytes,
+                    "storage_class": candidate.storage_class,
+                    "aec_or_vad_turn_input_authority": False,
+                },
+                "system_speech_session_join": {
+                    "observed_system_speech_session_id": (
+                        candidate.observed_system_speech_session_id
+                    ),
+                    "observed_generation": candidate.observed_generation,
+                    "active_system_speech_session_id": (
+                        candidate.active_system_speech_session_id
+                    ),
+                    "active_generation": candidate.active_generation,
+                    "playback_event_ref": candidate.playback_event_ref,
+                    "self_output_observation_ref": (
+                        candidate.self_output_observation_ref
+                    ),
+                    "self_output_observation_schema_version": (
+                        candidate.self_output_observation_schema_version
+                    ),
+                    "session_join_status": candidate.session_join_status,
+                    "post_compare_session_status": (
+                        candidate.post_compare_session_status
+                    ),
+                    "self_output_correlation_class": (
+                        candidate.self_output_correlation_class
+                    ),
+                    "active_session_exclusion_status": (
+                        candidate.active_session_exclusion_status
+                    ),
+                    "cooldown_status": candidate.cooldown_status,
+                    "opaque_refs_non_dereferenceable": True,
+                },
+                "one_use_gate": {
+                    "decision_owner": "ai_talk_core_input_gate",
+                    "compared_candidate_id": candidate.candidate_id,
+                    "candidate_identity_compare_status": "matched",
+                    "session_identity_compare_status": "matched",
+                    "generation_compare_status": "matched",
+                    "candidate_use_state": "unused",
+                    "compare_and_release_status": "succeeded",
+                    "one_use_consume_status": "consumed",
+                    "acceptance_status": "accepted_user_speech_candidate",
+                    "may_materialize_thought_core_turninput": True,
+                    "turninput_materialization_limit": 1,
+                },
+            },
+            "post_decision_audit": {
+                "serialized_contract_role": "post_decision_audit_only",
+                "process_local_capability_owner": "ai_talk_core_input_gate",
+                "materialization_executor": (
+                    "later_ai_talk_core_process_local_code"
+                ),
+                "process_local_one_use_capability_serialized": False,
+                "capability_mint_authority": False,
+                "capability_grant_authority": False,
+                "capability_transport_authority": False,
+                "internal_atomic_compare_completed": True,
+                "output_status": (
+                    "eligible_for_later_process_local_materialization"
+                ),
+                "may_materialize_thought_core_turninput": True,
+                "thought_core_turninput_materialized": False,
+                "thought_core_turninput_count": 0,
+            },
+            "redaction_guards": {
+                "raw_audio_included": False,
+                "raw_media_included": False,
+                "raw_transcript_included": False,
+                "raw_recognized_text_included": False,
+                "private_path_included": False,
+                "provider_payload_included": False,
+                "browser_storage_included": False,
+                "token_or_secret_included": False,
+                "home_control_action_authority_included": False,
+            },
+            "non_claims": [
+                "not_runtime_turn",
+                "not_audio_capture",
+                "not_stt_execution",
+                "not_user_heard_proof",
+                "not_home_control_action",
+                "not_touchdesigner_action",
+                "not_source_git_adoption",
+                "not_readiness_or_rr003_pass",
+            ],
+            "raw_private_publication_flags": False,
+        }
 
 
 def parse_input_gate_payload(payload: Mapping[str, Any]) -> InputGateEvent:

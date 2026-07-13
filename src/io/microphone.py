@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from dataclasses import dataclass
 from pathlib import Path
 import platform
 import re
@@ -17,6 +18,7 @@ from src.io.aec_reference import (
     LiveAecCaptureError,
     LiveAecProcessedCapture,
     capture_live_aec_processed_pcm,
+    get_adopted_live_aec_owner_selection,
 )
 from src.io.audio import (
     AudioEnvironmentError,
@@ -51,9 +53,33 @@ class WebRtcVadAdapter:
         module.init(self._vad)
         module.set_mode(self._vad, aggressiveness)
 
-    def is_speech(self, frame: bytes, sample_rate: int) -> bool:
+    def is_speech(self, frame: bytes | bytearray, sample_rate: int) -> bool:
         """Return whether a single PCM frame contains speech."""
         return self._module.process(self._vad, sample_rate, frame, int(len(frame) / 2))
+
+
+@dataclass(frozen=True, repr=False)
+class LiveMicrophoneCandidateWindow:
+    """One pathless, ephemeral processed-near-end candidate window."""
+
+    chunk: AudioChunk
+    packet_count: int
+    window_ms: int
+    frame_bytes: int = 320
+
+    def __repr__(self) -> str:
+        return "<live-microphone-candidate-window private-pcm>"
+
+    __str__ = __repr__
+
+    @property
+    def processed_byte_count(self) -> int:
+        """Return the bounded private PCM byte count without exposing bytes."""
+        return len(self.chunk.pcm16 or bytearray())
+
+    def clear(self) -> None:
+        """Clear the mutable PCM buffer owned by this window."""
+        self.chunk.clear()
 
 
 def get_temp_recording_path() -> Path:
@@ -369,6 +395,71 @@ def has_detectable_speech(
         if vad.is_speech(frame, sample_rate):
             return True
     return False
+
+
+def has_detectable_speech_pcm16(
+    pcm16: bytearray,
+    *,
+    sample_rate: int = 16_000,
+    aggressiveness: int = 2,
+    frame_ms: int = 10,
+    vad_factory: Callable[[int], Any] = WebRtcVadAdapter,
+) -> bool:
+    """Evaluate mutable PCM with VAD while clearing every temporary frame."""
+    if not isinstance(pcm16, bytearray):
+        raise AudioInputError("live speech detection requires mutable PCM")
+    validate_vad_aggressiveness(aggressiveness)
+    if sample_rate != 16_000 or frame_ms != 10:
+        raise AudioInputError("live speech detection frame contract is invalid")
+    frame_size = int(sample_rate * frame_ms / 1000) * 2
+    if frame_size != 320 or not pcm16 or len(pcm16) % frame_size != 0:
+        raise AudioInputError("live speech detection PCM bounds are invalid")
+    vad = vad_factory(aggressiveness)
+    for index in range(0, len(pcm16), frame_size):
+        frame = bytearray(pcm16[index:index + frame_size])
+        try:
+            if vad.is_speech(frame, sample_rate):
+                return True
+        finally:
+            frame[:] = b"\x00" * len(frame)
+    return False
+
+
+def capture_live_microphone_candidate_window(
+    *,
+    window_ms: int,
+    deadline_ms: int,
+    live_aec_capture: Callable[..., LiveAecProcessedCapture] = (
+        capture_live_aec_processed_pcm
+    ),
+) -> LiveMicrophoneCandidateWindow:
+    """Capture one window under the adopted DSP owner without granting authority."""
+    try:
+        capture = live_aec_capture(
+            owner_selection=get_adopted_live_aec_owner_selection(),
+            window_ms=window_ms,
+            deadline_ms=deadline_ms,
+        )
+    except LiveAecCaptureError as exc:
+        raise AudioEnvironmentError(exc.failure_class) from None
+    try:
+        chunk = AudioChunk(
+            path=None,
+            source="microphone",
+            pcm16=capture.pcm16,
+            sample_rate=capture.sample_rate,
+            storage_class=capture.storage_class,
+            turn_input_authority=capture.turn_input_authority,
+            turn_input_authority_class=capture.turn_input_authority_class,
+        )
+        return LiveMicrophoneCandidateWindow(
+            chunk=chunk,
+            packet_count=capture.packet_count,
+            window_ms=window_ms,
+        )
+    except Exception:
+        capture.clear()
+        raise
 
 
 def record_microphone_audio(

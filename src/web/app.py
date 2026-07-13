@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import _thread
 import argparse
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 import hmac
 from ipaddress import ip_address
@@ -41,9 +42,23 @@ from src.core.events import (
     new_turn_id,
     read_event_log_events,
 )
-from src.core.input_gate import InputGate, InputGateError, InputGateState
+from src.core.input_gate import (
+    InputGate,
+    InputGateError,
+    InputGateState,
+    UserSpeechCandidateEvidence,
+)
+from src.core.pipeline import TranscriptionResult, get_cached_transcription_pipeline
+from src.core.session import MicLoopSession, MicLoopTuning
 from src.core.status_report import build_doctor_status
 from src.core.handoff_bridge import build_handoff_metadata, load_handoff_bundle
+from src.io.aec_reference import LIVE_AEC_FIXED_CHILD_FAILURE_CLASSES
+from src.io.audio import AudioEnvironmentError, AudioInputError, AudioTranscriptionError
+from src.io.microphone import (
+    LiveMicrophoneCandidateWindow,
+    capture_live_microphone_candidate_window,
+    has_detectable_speech_pcm16,
+)
 from src.web.transcription_service import (
     WEB_MAX_UPLOAD_BYTES,
     WebTranscriptionRequest,
@@ -67,6 +82,7 @@ WEB_BIND_HOST_CONFIG = "WEB_BIND_HOST"
 WEB_BIND_PORT_CONFIG = "WEB_BIND_PORT"
 WEB_STARTED_AT_CONFIG = "WEB_STARTED_AT"
 RUNTIME_STATUS_WRITER_CONFIG = "RUNTIME_STATUS_WRITER"
+PRIVATE_TURN_SINK_CONFIG = "PRIVATE_TURN_SINK"
 WEB_MODULE_NAME = "ai_talk_core.web"
 SWORD_AGENT_TOKEN_HEADER = "X-Sword-Agent-Token"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -78,6 +94,7 @@ TOKEN_PROTECTED_ENDPOINTS = {
     "api_health",
     "api_input_gate_get",
     "api_input_gate_post",
+    "api_live_input_gate_candidate_window",
     "api_recording_chunk",
     "api_status",
     "api_agent_handoff_latest",
@@ -131,6 +148,16 @@ CLIENT_TURN_ID_PATTERN = re.compile(r"^web_[a-f0-9]{32}$")
 CLIENT_WALL_TIMESTAMP_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
 )
+LIVE_CANDIDATE_SCENARIOS = {
+    "self_output_or_ambiguous",
+    "independent_current_session_user_speech",
+}
+LIVE_CANDIDATE_REQUEST_FIELDS = {"scenario", "window_ms", "deadline_ms"}
+LIVE_CANDIDATE_SINK_SUCCESS = {
+    "result_class": "thought_core_turninput_accepted",
+    "submission_count": 1,
+    "thought_core_turninput_count": 1,
+}
 
 
 class WebRuntimeState:
@@ -240,6 +267,9 @@ def create_app(
     port: int = 8000,
     runtime_status_writer: RuntimeStatusWriter | None = None,
     started_at: str | None = None,
+    private_turn_sink: (
+        Callable[[Mapping[str, object], str], Mapping[str, object]] | None
+    ) = None,
 ) -> Flask:
     """Create the local Flask application."""
     app = Flask(__name__)
@@ -256,7 +286,9 @@ def create_app(
         started_at or datetime.now(UTC).isoformat().replace("+00:00", "Z")
     )
     app.config[RUNTIME_STATUS_WRITER_CONFIG] = runtime_status_writer
+    app.config[PRIVATE_TURN_SINK_CONFIG] = private_turn_sink
     input_gate = InputGate()
+    live_candidate_window_lock = threading.Lock()
 
     @app.before_request
     def enforce_local_request_policy() -> tuple[object, int] | None:
@@ -533,6 +565,47 @@ def create_app(
             return jsonify({"ok": False, "error": str(exc)}), 400
         return jsonify(build_input_gate_response(state)), 200
 
+    @app.post("/api/live-input-gate/candidate-window")
+    def api_live_input_gate_candidate_window() -> tuple[object, int]:
+        payload = request.get_json(silent=True)
+        try:
+            scenario, window_ms, deadline_ms = validate_live_candidate_request(
+                payload
+            )
+        except InputGateError:
+            return jsonify(
+                build_live_candidate_window_response(
+                    result_class="live_candidate_request_invalid",
+                    expectation_class="not_evaluated",
+                )
+            ), 400
+        finally:
+            if isinstance(payload, dict):
+                payload.clear()
+        if not live_candidate_window_lock.acquire(blocking=False):
+            return jsonify(
+                build_live_candidate_window_response(
+                    result_class="live_candidate_window_busy",
+                    expectation_class="not_evaluated",
+                )
+            ), 409
+        try:
+            response = execute_live_candidate_window(
+                input_gate=input_gate,
+                scenario=scenario,
+                window_ms=window_ms,
+                deadline_ms=deadline_ms,
+                private_turn_sink=app.config.get(PRIVATE_TURN_SINK_CONFIG),
+            )
+        finally:
+            live_candidate_window_lock.release()
+        status = 200 if response["result_class"] in {
+            "self_output_or_ambiguous_confirmed",
+            "independent_user_speech_turninput_accepted",
+            "scenario_expectation_not_met",
+        } else 503
+        return jsonify(response), status
+
     @app.get("/api/health")
     def api_health() -> tuple[object, int]:
         return jsonify(
@@ -565,6 +638,220 @@ def create_app(
         )
 
     return app
+
+
+def validate_live_candidate_request(
+    payload: object,
+) -> tuple[str, int, int]:
+    """Validate the bounded expectation-only request surface."""
+    if not isinstance(payload, dict) or set(payload) != LIVE_CANDIDATE_REQUEST_FIELDS:
+        raise InputGateError("live candidate request fields are invalid")
+    scenario = payload.get("scenario")
+    window_ms = payload.get("window_ms")
+    deadline_ms = payload.get("deadline_ms")
+    if scenario not in LIVE_CANDIDATE_SCENARIOS:
+        raise InputGateError("live candidate scenario is invalid")
+    if (
+        isinstance(window_ms, bool)
+        or not isinstance(window_ms, int)
+        or not 100 <= window_ms <= 3000
+    ):
+        raise InputGateError("live candidate window is invalid")
+    if (
+        isinstance(deadline_ms, bool)
+        or not isinstance(deadline_ms, int)
+        or not window_ms + 200 <= deadline_ms <= 10_000
+    ):
+        raise InputGateError("live candidate deadline is invalid")
+    return str(scenario), window_ms, deadline_ms
+
+
+def build_live_candidate_window_response(
+    *,
+    result_class: str,
+    expectation_class: str,
+    capture_packet_count: int = 0,
+    capture_byte_count: int = 0,
+    transcription_count: int = 0,
+    submission_count: int = 0,
+    thought_core_turninput_count: int = 0,
+    elapsed_ms: int = 0,
+    pcm_cleanup_count: int = 0,
+    private_authority_residue_count: int = 0,
+) -> dict[str, object]:
+    """Return only bounded class/count/timing/cleanup evidence."""
+    return {
+        "schema_version": "ai_talk_core.live_input_gate_candidate_window.v0",
+        "result_class": result_class,
+        "expectation_class": expectation_class,
+        "capture_packet_count": capture_packet_count,
+        "capture_byte_count": capture_byte_count,
+        "transcription_count": transcription_count,
+        "submission_count": submission_count,
+        "thought_core_turninput_count": thought_core_turninput_count,
+        "elapsed_ms": elapsed_ms,
+        "pcm_cleanup_count": pcm_cleanup_count,
+        "private_authority_residue_count": private_authority_residue_count,
+        "raw_private_publication_flags": False,
+    }
+
+
+def execute_live_candidate_window(
+    *,
+    input_gate: InputGate,
+    scenario: str,
+    window_ms: int,
+    deadline_ms: int,
+    private_turn_sink: object,
+) -> dict[str, object]:
+    """Own one private capture, gate decision, transcription and sink handoff."""
+    started = time.monotonic()
+    capture_window: LiveMicrophoneCandidateWindow | None = None
+    transcript = ""
+    packet_count = 0
+    byte_count = 0
+    transcription_count = 0
+    submission_count = 0
+    turninput_count = 0
+    result_class = "live_candidate_window_failed"
+    expectation_class = "not_evaluated"
+    session: MicLoopSession | None = None
+    transcription: TranscriptionResult | None = None
+    candidate_audit: dict[str, object] | None = None
+    sink_result: object | None = None
+    candidate: UserSpeechCandidateEvidence | None = None
+    capability: object | None = None
+    try:
+        capture_window = capture_live_microphone_candidate_window(
+            window_ms=window_ms,
+            deadline_ms=deadline_ms,
+        )
+        packet_count = capture_window.packet_count
+        byte_count = capture_window.processed_byte_count
+        pcm16 = capture_window.chunk.pcm16
+        if pcm16 is None:
+            raise AudioInputError("live candidate PCM is unavailable")
+        has_speech = has_detectable_speech_pcm16(pcm16)
+        candidate = input_gate.evaluate_live_processed_candidate(
+            has_speech=has_speech,
+            window_ms=window_ms,
+            packet_count=packet_count,
+            processed_byte_count=byte_count,
+            frame_bytes=capture_window.frame_bytes,
+        )
+        expected_acceptance = (
+            scenario == "independent_current_session_user_speech"
+        )
+        actual_acceptance = candidate is not None
+        if expected_acceptance != actual_acceptance:
+            result_class = "scenario_expectation_not_met"
+            expectation_class = "mismatch"
+        elif not expected_acceptance:
+            result_class = "self_output_or_ambiguous_confirmed"
+            expectation_class = "matched"
+        else:
+            expectation_class = "matched"
+            capability = input_gate.issue_turn_input_capability(candidate)
+            if capability is None:
+                result_class = "input_gate_capability_unavailable"
+            else:
+                pipeline = get_cached_transcription_pipeline()
+                session = MicLoopSession(
+                    pipeline=pipeline,
+                    tuning=MicLoopTuning(
+                        vad_aggressiveness=2,
+                        final_stable_seconds=8,
+                    ),
+                    input_gate=input_gate,
+                )
+                transcription_count = 1
+                transcription = session.process_chunk(
+                    capture_window.chunk,
+                    has_speech=True,
+                    language="ja",
+                    chunk_duration=max(1, math.ceil(window_ms / 1000)),
+                    is_last_iteration=True,
+                    candidate_evidence=candidate,
+                    turn_input_capability=capability,
+                )
+                transcript = transcription.text.strip()
+                candidate_audit = (
+                    input_gate.build_consumed_candidate_audit(candidate)
+                    if transcript
+                    else None
+                )
+                if not transcript or candidate_audit is None:
+                    result_class = "private_transcription_not_accepted"
+                elif not callable(private_turn_sink):
+                    result_class = "private_turn_sink_unavailable"
+                else:
+                    try:
+                        sink_result = private_turn_sink(candidate_audit, transcript)
+                    except Exception:
+                        sink_result = None
+                    if (
+                        isinstance(sink_result, Mapping)
+                        and dict(sink_result) == LIVE_CANDIDATE_SINK_SUCCESS
+                    ):
+                        submission_count = 1
+                        turninput_count = 1
+                        result_class = (
+                            "independent_user_speech_turninput_accepted"
+                        )
+                    else:
+                        result_class = "private_turn_sink_failed"
+    except AudioEnvironmentError as exc:
+        failure_class = str(exc)
+        result_class = (
+            failure_class
+            if failure_class in LIVE_AEC_FIXED_CHILD_FAILURE_CLASSES
+            else "live_candidate_environment_unavailable"
+        )
+    except (AudioInputError, AudioTranscriptionError):
+        result_class = "live_candidate_processing_failed"
+    except Exception:
+        result_class = "live_candidate_window_failed"
+    finally:
+        if capability is not None and candidate is not None:
+            input_gate.cancel_turn_input_capability(capability, candidate)
+        if candidate is not None:
+            input_gate.discard_consumed_candidate(candidate)
+        private_authority_residue_count = (
+            input_gate.private_authority_residue_count()
+        )
+        transcript = ""
+        candidate_audit = None
+        sink_result = None
+        transcription = None
+        if session is not None:
+            session.state.previous_text = None
+            session.state.last_spoken_result = None
+            session.state.finalized_text = None
+            for buffered_chunk in session.state.buffer.chunks:
+                buffered_chunk.clear()
+            session.state.buffer.chunks.clear()
+        pcm_cleanup_count = 0
+        if capture_window is not None:
+            capture_window.clear()
+            pcm16 = capture_window.chunk.pcm16
+            if pcm16 is not None and all(value == 0 for value in pcm16):
+                pcm_cleanup_count = 1
+        elapsed_ms = min(
+            20_000,
+            max(0, int((time.monotonic() - started) * 1000)),
+        )
+    return build_live_candidate_window_response(
+        result_class=result_class,
+        expectation_class=expectation_class,
+        capture_packet_count=packet_count,
+        capture_byte_count=byte_count,
+        transcription_count=transcription_count,
+        submission_count=submission_count,
+        thought_core_turninput_count=turninput_count,
+        elapsed_ms=elapsed_ms,
+        pcm_cleanup_count=pcm_cleanup_count,
+        private_authority_residue_count=private_authority_residue_count,
+    )
 
 
 def build_shutdown_response(reason: str, *, force: bool = False) -> tuple[object, int]:
