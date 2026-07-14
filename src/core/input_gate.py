@@ -546,6 +546,55 @@ class InputGate:
         with self._lock:
             return len(self._pending) + len(self._consumed_candidates)
 
+    def body_state_projection(self) -> dict[str, bool | str]:
+        """Return the fixed, textless current hearing-organ state projection."""
+        with self._lock:
+            lifecycle = self._lifecycle
+            self_output = self._self_output
+            lifecycle_class = (
+                lifecycle.lifecycle_state if lifecycle is not None else "missing"
+            )
+            observation_matches = bool(
+                lifecycle is not None
+                and self_output is not None
+                and _same_observation_context(lifecycle, self_output)
+            )
+            pending_authority = bool(
+                self._pending or self._consumed_candidates
+            )
+
+            if (
+                lifecycle_class in {"handoff_accepted", "cooldown"}
+                and observation_matches
+            ):
+                self_state_class = "self-speaking"
+            elif (
+                lifecycle_class == "released"
+                and observation_matches
+                and self._state.enabled
+                and not pending_authority
+            ):
+                self_state_class = "input-receivable"
+            else:
+                self_state_class = "ambiguity-held"
+
+            return {
+                "schema_version": "input_gate_body_state.v0",
+                "self_state_class": self_state_class,
+                "input_availability_class": (
+                    "enabled" if self._state.enabled else "disabled"
+                ),
+                "system_speech_intent_class": lifecycle_class,
+                "self_output_observation_class": (
+                    "matched_current" if observation_matches else "missing"
+                ),
+                "pending_private_authority_class": (
+                    "nonzero" if pending_authority else "zero"
+                ),
+                "projection_freshness_class": "current_owner_read",
+                "raw_private_publication_flags": False,
+            }
+
     def live_capture_processing_mode_class(self) -> str:
         """Choose signal processing from gate-owned causal state only."""
         with self._lock:

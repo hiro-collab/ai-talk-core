@@ -3404,6 +3404,127 @@ class SmokeTests(unittest.TestCase):
         self.assertFalse(gate.consume_turn_input_capability(capability, candidate))
         self.assertIsNone(gate.issue_turn_input_capability(candidate))
 
+    def test_body_state_projection_is_owned_fixed_class_and_fails_closed(self) -> None:
+        """Only the InputGate owner may project current hearing-organ state."""
+        expected_keys = {
+            "schema_version",
+            "self_state_class",
+            "input_availability_class",
+            "system_speech_intent_class",
+            "self_output_observation_class",
+            "pending_private_authority_class",
+            "projection_freshness_class",
+            "raw_private_publication_flags",
+        }
+        gate = InputGate()
+        initial = gate.body_state_projection()
+        self.assertEqual(set(initial), expected_keys)
+        self.assertEqual(initial["self_state_class"], "ambiguity-held")
+        self.assertEqual(initial["system_speech_intent_class"], "missing")
+        self.assertEqual(initial["self_output_observation_class"], "missing")
+
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("handoff_accepted"),
+        )
+        queue_only = gate.body_state_projection()
+        self.assertEqual(queue_only["self_state_class"], "ambiguity-held")
+        gate.observe_self_output_observation(build_self_output_observation())
+        speaking = gate.body_state_projection()
+        self.assertEqual(speaking["self_state_class"], "self-speaking")
+        self.assertEqual(
+            speaking["self_output_observation_class"],
+            "matched_current",
+        )
+
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("cooldown"),
+            wall_timestamp="2026-07-13T12:00:01.000Z",
+        )
+        self.assertEqual(
+            gate.body_state_projection()["self_state_class"],
+            "self-speaking",
+        )
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("released"),
+            wall_timestamp="2026-07-13T12:00:02.000Z",
+        )
+        receivable = gate.body_state_projection()
+        self.assertEqual(receivable["self_state_class"], "input-receivable")
+        self.assertEqual(
+            receivable["pending_private_authority_class"],
+            "zero",
+        )
+
+        candidate = build_user_speech_candidate()
+        capability = gate.issue_turn_input_capability(candidate)
+        self.assertIsNotNone(capability)
+        pending = gate.body_state_projection()
+        self.assertEqual(pending["self_state_class"], "ambiguity-held")
+        self.assertEqual(
+            pending["pending_private_authority_class"],
+            "nonzero",
+        )
+        self.assertTrue(gate.cancel_turn_input_capability(capability, candidate))
+        gate.set_input_enabled(False)
+        disabled = gate.body_state_projection()
+        self.assertEqual(disabled["self_state_class"], "ambiguity-held")
+        self.assertEqual(disabled["input_availability_class"], "disabled")
+        self.assertFalse(disabled["raw_private_publication_flags"])
+
+    def test_body_state_endpoint_has_exact_keys_and_ignores_caller_authority(self) -> None:
+        """Query strings and private markers cannot set or enter owner state."""
+        marker = "private-body-state-marker-do-not-echo"
+        app = create_app()
+        app.config[ENABLE_PROCESS_SHUTDOWN_CONFIG] = False
+        client = app.test_client()
+        headers = {"X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]}
+        unauthorized = client.get(
+            "/api/input-gate/body-state",
+            query_string={"transcript": marker},
+        )
+        self.assertEqual(unauthorized.status_code, 403)
+        self.assertNotIn("self_state_class", unauthorized.get_data(as_text=True))
+        self.assertNotIn(marker, unauthorized.get_data(as_text=True))
+        wrong_token = client.get(
+            "/api/input-gate/body-state",
+            headers={"X-AI-Core-Token": "wrong-token"},
+            query_string={"transcript": marker},
+        )
+        self.assertEqual(wrong_token.status_code, 403)
+        self.assertNotIn("self_state_class", wrong_token.get_data(as_text=True))
+        self.assertNotIn(marker, wrong_token.get_data(as_text=True))
+        post_current_lifecycle_events(client, headers)
+        response = client.get(
+            "/api/input-gate/body-state",
+            headers=headers,
+            query_string={
+                "self_state_class": "self-speaking",
+                "transcript": marker,
+                "pcm16": marker,
+                "candidate_id": marker,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(
+            set(payload),
+            {
+                "schema_version",
+                "self_state_class",
+                "input_availability_class",
+                "system_speech_intent_class",
+                "self_output_observation_class",
+                "pending_private_authority_class",
+                "projection_freshness_class",
+                "raw_private_publication_flags",
+            },
+        )
+        self.assertEqual(payload["self_state_class"], "input-receivable")
+        self.assertNotIn(marker, response.get_data(as_text=True))
+
     def test_private_pcm_session_consumes_before_one_transcription(self) -> None:
         """MicLoopSession should consume once immediately before private PCM STT."""
         gate = prepare_current_input_gate()

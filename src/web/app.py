@@ -94,6 +94,7 @@ TOKEN_PROTECTED_ENDPOINTS = {
     "api_event_ingest",
     "api_events",
     "api_health",
+    "api_input_gate_body_state_get",
     "api_input_gate_get",
     "api_input_gate_post",
     "api_live_input_gate_candidate_window",
@@ -581,6 +582,10 @@ def create_app(
         except InputGateError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
         return jsonify(build_input_gate_response(state)), 200
+
+    @app.get("/api/input-gate/body-state")
+    def api_input_gate_body_state_get() -> tuple[object, int]:
+        return jsonify(input_gate.body_state_projection()), 200
 
     @app.post("/api/live-input-gate/candidate-window")
     def api_live_input_gate_candidate_window() -> tuple[object, int]:
