@@ -223,14 +223,32 @@ def list_ffmpeg_dshow_audio_devices() -> list[str]:
 
 
 def get_default_ffmpeg_dshow_microphone_device() -> str:
-    """Return the first DirectShow audio input reported by ffmpeg."""
-    devices = list_ffmpeg_dshow_audio_devices()
-    if devices:
-        return devices[0]
+    """Return one unambiguous non-test DirectShow microphone."""
+    devices = list(dict.fromkeys(list_ffmpeg_dshow_audio_devices()))
+    candidates = [
+        device
+        for device in devices
+        if not _is_prepared_sample_virtual_microphone(device)
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise AudioEnvironmentError(
+            "multiple DirectShow audio capture devices found. "
+            "Pass the intended device name with --mic-device."
+        )
     raise AudioEnvironmentError(
-        "no DirectShow audio capture device found. "
+        "no unambiguous non-test DirectShow audio capture device found. "
         "Run `ffmpeg -hide_banner -list_devices true -f dshow -i dummy` "
         "and pass a device name with --mic-device."
+    )
+
+
+def _is_prepared_sample_virtual_microphone(device: str) -> bool:
+    """Return whether a device is the test-only prepared-sample cable."""
+    normalized = device.strip().casefold()
+    return normalized.startswith("cable output") or (
+        "vb-audio" in normalized and "virtual cable" in normalized
     )
 
 

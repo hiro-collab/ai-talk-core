@@ -104,6 +104,7 @@ from src.io.microphone import (
     capture_microphone_chunk,
     classify_live_pcm16_signal,
     find_last_vad_speech_frame_offset_ms,
+    get_default_ffmpeg_dshow_microphone_device,
     get_microphone_runtime_status,
     get_recording_timeout_seconds,
     has_detectable_speech_pcm16,
@@ -2303,6 +2304,47 @@ class SmokeTests(unittest.TestCase):
                 subprocess_run.call_args.kwargs["timeout"],
                 MICROPHONE_DEVICE_LIST_TIMEOUT_SECONDS,
             )
+
+    def test_default_dshow_microphone_ignores_prepared_sample_cable(self) -> None:
+        """Automatic native capture should choose one physical candidate."""
+        with mock.patch(
+            "src.io.microphone.list_ffmpeg_dshow_audio_devices",
+            return_value=[
+                "CABLE Output (VB-Audio Virtual Cable)",
+                "Microphone (USB Camera)",
+            ],
+        ):
+            self.assertEqual(
+                get_default_ffmpeg_dshow_microphone_device(),
+                "Microphone (USB Camera)",
+            )
+
+    def test_default_dshow_microphone_fails_closed_when_physical_is_ambiguous(
+        self,
+    ) -> None:
+        """Automatic native capture must not depend on device enumeration order."""
+        with mock.patch(
+            "src.io.microphone.list_ffmpeg_dshow_audio_devices",
+            return_value=[
+                "Microphone (USB Camera)",
+                "Microphone Array (Built-in Audio)",
+            ],
+        ), self.assertRaisesRegex(
+            AudioEnvironmentError,
+            "multiple DirectShow audio capture devices found",
+        ):
+            get_default_ffmpeg_dshow_microphone_device()
+
+    def test_default_dshow_microphone_does_not_promote_test_cable(self) -> None:
+        """The prepared-sample cable remains explicit and test-only."""
+        with mock.patch(
+            "src.io.microphone.list_ffmpeg_dshow_audio_devices",
+            return_value=["CABLE Output (VB-Audio Virtual Cable)"],
+        ), self.assertRaisesRegex(
+            AudioEnvironmentError,
+            "no unambiguous non-test DirectShow audio capture device found",
+        ):
+            get_default_ffmpeg_dshow_microphone_device()
 
     def test_record_microphone_audio_uses_arecord_backend(self) -> None:
         """Linux microphone backend should keep the existing arecord command shape."""
