@@ -156,11 +156,27 @@ LIVE_CANDIDATE_SCENARIOS = {
     "independent_current_session_user_speech",
 }
 LIVE_CANDIDATE_REQUEST_FIELDS = {"scenario", "window_ms", "deadline_ms"}
-LIVE_CANDIDATE_SINK_SUCCESS = {
-    "result_class": "thought_core_turninput_accepted",
-    "submission_count": 1,
-    "thought_core_turninput_count": 1,
+LIVE_CANDIDATE_SINK_RESULT_FIELDS = {
+    "result_class",
+    "submission_count",
+    "thought_core_turninput_count",
+    "presentation_class",
+    "assistant_event_id",
+    "thought_core_first_event_elapsed_ms",
+    "raw_private_publication_flags",
 }
+LIVE_CANDIDATE_PRESENTATION_CLASSES = {
+    "aituber_presentation_forwarded",
+    "aituber_presentation_forwarded_timing_unavailable",
+    "aituber_presentation_not_forwarded",
+}
+LIVE_CANDIDATE_ASSISTANT_EVENT_ID_PATTERN = re.compile(
+    r"^[A-Za-z0-9_.:-]{1,128}$"
+)
+LIVE_CANDIDATE_PRIVATE_EVENT_ID_TOKEN_PATTERN = re.compile(
+    r"(?:^|[._:-])(?:private|raw|secret|token|transcript|prompt|path|url)(?:$|[._:-])",
+    flags=re.IGNORECASE,
+)
 
 
 class WebRuntimeState:
@@ -703,6 +719,9 @@ def build_live_candidate_window_response(
     last_vad_speech_frame_offset_ms: int | None = None,
     utterance_end_to_candidate_result_ms: int | None = None,
     utterance_end_timing_class: str = "not_evaluated",
+    presentation_class: str = "presentation_not_attempted",
+    assistant_event_id: str | None = None,
+    thought_core_first_event_elapsed_ms: int | None = None,
     pcm_cleanup_count: int = 0,
     private_authority_residue_count: int = 0,
 ) -> dict[str, object]:
@@ -724,6 +743,11 @@ def build_live_candidate_window_response(
             utterance_end_to_candidate_result_ms
         ),
         "utterance_end_timing_class": utterance_end_timing_class,
+        "presentation_class": presentation_class,
+        "assistant_event_id": assistant_event_id,
+        "thought_core_first_event_elapsed_ms": (
+            thought_core_first_event_elapsed_ms
+        ),
         "pcm_cleanup_count": pcm_cleanup_count,
         "private_authority_residue_count": private_authority_residue_count,
         "raw_private_publication_flags": False,
@@ -749,6 +773,9 @@ def execute_live_candidate_window(
     transcription_count = 0
     submission_count = 0
     turninput_count = 0
+    presentation_class = "presentation_not_attempted"
+    assistant_event_id: str | None = None
+    thought_core_first_event_elapsed_ms: int | None = None
     last_vad_speech_frame_offset_ms: int | None = None
     utterance_end_to_candidate_result_ms: int | None = None
     utterance_end_timing_class = "not_evaluated"
@@ -846,12 +873,23 @@ def execute_live_candidate_window(
                         sink_result = private_turn_sink(candidate_audit, transcript)
                     except Exception:
                         sink_result = None
-                    if (
-                        isinstance(sink_result, Mapping)
-                        and dict(sink_result) == LIVE_CANDIDATE_SINK_SUCCESS
-                    ):
+                    validated_sink_result = _validate_live_candidate_sink_result(
+                        sink_result
+                    )
+                    if validated_sink_result is not None:
                         submission_count = 1
                         turninput_count = 1
+                        presentation_class = str(
+                            validated_sink_result["presentation_class"]
+                        )
+                        assistant_event_id = validated_sink_result[
+                            "assistant_event_id"
+                        ]
+                        thought_core_first_event_elapsed_ms = (
+                            validated_sink_result[
+                                "thought_core_first_event_elapsed_ms"
+                            ]
+                        )
                         result_class = (
                             "independent_user_speech_turninput_accepted"
                         )
@@ -918,9 +956,67 @@ def execute_live_candidate_window(
             utterance_end_to_candidate_result_ms
         ),
         utterance_end_timing_class=utterance_end_timing_class,
+        presentation_class=presentation_class,
+        assistant_event_id=assistant_event_id,
+        thought_core_first_event_elapsed_ms=(
+            thought_core_first_event_elapsed_ms
+        ),
         pcm_cleanup_count=pcm_cleanup_count,
         private_authority_residue_count=private_authority_residue_count,
     )
+
+
+def _validate_live_candidate_sink_result(
+    value: object,
+) -> dict[str, object] | None:
+    if not isinstance(value, Mapping) or set(value) != LIVE_CANDIDATE_SINK_RESULT_FIELDS:
+        return None
+    if (
+        value.get("result_class") != "thought_core_turninput_accepted"
+        or value.get("submission_count") != 1
+        or isinstance(value.get("submission_count"), bool)
+        or value.get("thought_core_turninput_count") != 1
+        or isinstance(value.get("thought_core_turninput_count"), bool)
+        or value.get("raw_private_publication_flags") is not False
+    ):
+        return None
+
+    presentation_class = value.get("presentation_class")
+    assistant_event_id = value.get("assistant_event_id")
+    first_event_elapsed_ms = value.get("thought_core_first_event_elapsed_ms")
+    if presentation_class not in LIVE_CANDIDATE_PRESENTATION_CLASSES:
+        return None
+    if presentation_class == "aituber_presentation_not_forwarded":
+        if assistant_event_id is not None or first_event_elapsed_ms is not None:
+            return None
+    else:
+        if (
+            not isinstance(assistant_event_id, str)
+            or LIVE_CANDIDATE_ASSISTANT_EVENT_ID_PATTERN.fullmatch(
+                assistant_event_id
+            )
+            is None
+            or LIVE_CANDIDATE_PRIVATE_EVENT_ID_TOKEN_PATTERN.search(
+                assistant_event_id
+            )
+            is not None
+        ):
+            return None
+        if presentation_class == "aituber_presentation_forwarded":
+            if (
+                isinstance(first_event_elapsed_ms, bool)
+                or not isinstance(first_event_elapsed_ms, int)
+                or not 0 <= first_event_elapsed_ms <= 20_000
+            ):
+                return None
+        elif first_event_elapsed_ms is not None:
+            return None
+
+    return {
+        "presentation_class": presentation_class,
+        "assistant_event_id": assistant_event_id,
+        "thought_core_first_event_elapsed_ms": first_event_elapsed_ms,
+    }
 
 
 def build_shutdown_response(reason: str, *, force: bool = False) -> tuple[object, int]:

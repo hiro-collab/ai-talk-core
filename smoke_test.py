@@ -139,6 +139,7 @@ from src.web.app import (
     WEB_RECORDING_CHUNK_RETENTION_SECONDS,
     WEB_MAX_RECORDING_CHUNKS,
     RuntimeStatusWriter,
+    _validate_live_candidate_sink_result,
     build_runtime_status_payload,
     build_input_gate_response,
     create_app,
@@ -5676,6 +5677,10 @@ class SmokeTests(unittest.TestCase):
                 "result_class": "thought_core_turninput_accepted",
                 "submission_count": 1,
                 "thought_core_turninput_count": 1,
+                "presentation_class": "aituber_presentation_not_forwarded",
+                "assistant_event_id": None,
+                "thought_core_first_event_elapsed_ms": None,
+                "raw_private_publication_flags": False,
             }
         )
         app = create_app(private_turn_sink=sink)
@@ -5782,6 +5787,10 @@ class SmokeTests(unittest.TestCase):
                 "result_class": "thought_core_turninput_accepted",
                 "submission_count": 1,
                 "thought_core_turninput_count": 1,
+                "presentation_class": "aituber_presentation_forwarded",
+                "assistant_event_id": "evt-live-visible-1",
+                "thought_core_first_event_elapsed_ms": 125,
+                "raw_private_publication_flags": False,
             }
 
         app = create_app(private_turn_sink=sink)
@@ -5851,6 +5860,9 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(payload["transcription_count"], 1)
         self.assertEqual(payload["submission_count"], 1)
         self.assertEqual(payload["thought_core_turninput_count"], 1)
+        self.assertEqual(payload["presentation_class"], "aituber_presentation_forwarded")
+        self.assertEqual(payload["assistant_event_id"], "evt-live-visible-1")
+        self.assertEqual(payload["thought_core_first_event_elapsed_ms"], 125)
         self.assertEqual(payload["signal_class"], "signal_above_floor")
         self.assertEqual(payload["vad_decision_class"], "speech_detected")
         self.assertEqual(payload["last_vad_speech_frame_offset_ms"], 40)
@@ -5876,6 +5888,9 @@ class SmokeTests(unittest.TestCase):
                 "last_vad_speech_frame_offset_ms",
                 "utterance_end_to_candidate_result_ms",
                 "utterance_end_timing_class",
+                "presentation_class",
+                "assistant_event_id",
+                "thought_core_first_event_elapsed_ms",
                 "pcm_cleanup_count",
                 "private_authority_residue_count",
                 "raw_private_publication_flags",
@@ -5905,6 +5920,46 @@ class SmokeTests(unittest.TestCase):
         self.assertNotIn(SYSTEM_SPEECH_SESSION_ID, serialized_response)
         self.assertNotIn(PLAYBACK_EVENT_REF, serialized_response)
         self.assertNotIn("candidate_id", serialized_response)
+
+    def test_live_candidate_sink_result_contract_rejects_extras_private_ids_and_cross_field_mismatch(
+        self,
+    ) -> None:
+        valid = {
+            "result_class": "thought_core_turninput_accepted",
+            "submission_count": 1,
+            "thought_core_turninput_count": 1,
+            "presentation_class": "aituber_presentation_forwarded",
+            "assistant_event_id": "evt-live-visible-1",
+            "thought_core_first_event_elapsed_ms": 125,
+            "raw_private_publication_flags": False,
+        }
+        self.assertEqual(
+            _validate_live_candidate_sink_result(valid),
+            {
+                "presentation_class": "aituber_presentation_forwarded",
+                "assistant_event_id": "evt-live-visible-1",
+                "thought_core_first_event_elapsed_ms": 125,
+            },
+        )
+        invalid_variants = (
+            {**valid, "transcript": "private-do-not-echo"},
+            {**valid, "assistant_event_id": "evt.private.marker"},
+            {**valid, "thought_core_first_event_elapsed_ms": True},
+            {**valid, "thought_core_first_event_elapsed_ms": 20_001},
+            {
+                **valid,
+                "presentation_class": "aituber_presentation_not_forwarded",
+            },
+            {
+                **valid,
+                "presentation_class": (
+                    "aituber_presentation_forwarded_timing_unavailable"
+                ),
+            },
+        )
+        for value in invalid_variants:
+            with self.subTest(value=value):
+                self.assertIsNone(_validate_live_candidate_sink_result(value))
 
     def test_live_candidate_scenario_is_expectation_only(self) -> None:
         """Scenario labels must never force acceptance or classification."""
