@@ -46,6 +46,8 @@ from src.core.input_gate import (
     InputGate,
     InputGateError,
     InputGateState,
+    LIVE_CAPTURE_MODE_AEC,
+    LIVE_CAPTURE_MODE_NS_AGC,
     UserSpeechCandidateEvidence,
 )
 from src.core.pipeline import TranscriptionResult, get_cached_transcription_pipeline
@@ -710,6 +712,7 @@ def build_live_candidate_window_response(
     *,
     result_class: str,
     expectation_class: str,
+    accepted_join_class: str = "not_accepted",
     capture_packet_count: int = 0,
     capture_byte_count: int = 0,
     signal_class: str = "not_evaluated",
@@ -737,6 +740,7 @@ def build_live_candidate_window_response(
         "schema_version": "ai_talk_core.live_input_gate_candidate_window.v0",
         "result_class": result_class,
         "expectation_class": expectation_class,
+        "accepted_join_class": accepted_join_class,
         "capture_packet_count": capture_packet_count,
         "capture_byte_count": capture_byte_count,
         "signal_class": signal_class,
@@ -826,6 +830,7 @@ def execute_live_candidate_window(
     inflight_sink_cancellation_class = "not_applicable"
     result_class = "live_candidate_window_failed"
     expectation_class = "not_evaluated"
+    accepted_join_class = "not_accepted"
     session: MicLoopSession | None = None
     transcription: TranscriptionResult | None = None
     candidate_audit: dict[str, object] | None = None
@@ -889,6 +894,14 @@ def execute_live_candidate_window(
             scenario == "independent_current_session_user_speech"
         )
         actual_acceptance = candidate is not None
+        if actual_acceptance:
+            accepted_join_class = (
+                "active_self_output_overlap"
+                if processing_mode_class == LIVE_CAPTURE_MODE_AEC
+                else "released_normal_input"
+                if processing_mode_class == LIVE_CAPTURE_MODE_NS_AGC
+                else "not_accepted"
+            )
         if has_speech and last_vad_speech_frame_offset_ms is None:
             result_class = "speech_timing_observation_missing"
             expectation_class = "not_evaluated"
@@ -1096,6 +1109,7 @@ def execute_live_candidate_window(
     return build_live_candidate_window_response(
         result_class=result_class,
         expectation_class=expectation_class,
+        accepted_join_class=accepted_join_class,
         capture_packet_count=packet_count,
         capture_byte_count=byte_count,
         signal_class=signal_class,
