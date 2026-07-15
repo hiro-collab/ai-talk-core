@@ -18,6 +18,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from src.core.input_gate import (
+    NEAR_END_DISTINGUISHED_CLASS,
+    SELF_OUTPUT_OR_AMBIGUOUS_CLASS,
+)
+
 
 AEC_OWNER_CLASSES = (
     "windows_voice_capture_dsp",
@@ -63,6 +68,8 @@ LIVE_AEC_FIXED_CHILD_FAILURE_CLASSES = frozenset(
         "live_aec_processed_packet_invalid",
         "live_aec_deadline_exceeded",
         "live_aec_cleanup_failed",
+        "live_aec_quality_metrics_cleanup_failed",
+        "live_aec_quality_metrics_invariant_failed",
         "live_aec_lifecycle_invariant_failed",
         "voice_capture_dsp_activation_failed",
         "voice_capture_dsp_configuration_failed",
@@ -82,6 +89,167 @@ _USED_NONCE_DIGEST_LIMIT = 1024
 _USED_NONCE_DIGESTS: list[bytes] = []
 _ACTIVE_NONCE_DIGESTS: set[bytes] = set()
 _USED_NONCE_LOCK = threading.Lock()
+_HELPER_TOP_LEVEL_FIELDS = {
+    "schema_version",
+    "proof_ceiling",
+    "result_class",
+    "capability_class",
+    "owner_class",
+    "source_class",
+    "observation",
+    "lifecycle",
+    "privacy",
+    "authority",
+    "does_not_prove",
+}
+_HELPER_OBSERVATION_FIELDS = {
+    "window_ms",
+    "packet_count",
+    "processed_byte_count",
+    "near_end_discrimination_class",
+    "quality_metrics_attempt_count",
+    "quality_metrics_valid_count",
+    "quality_metrics_trusted_count",
+    "quality_metrics_ambiguous_count",
+    "quality_metrics_cleanup_failure_count",
+    "live_capture_used",
+}
+_HELPER_LIFECYCLE_FIELDS = {
+    "backend_activate_count",
+    "capture_start_count",
+    "capture_stop_attempt_count",
+    "capture_stop_count",
+    "backend_resource_release_count",
+    "sink_connect_count",
+    "sink_write_count",
+    "sink_release_count",
+    "cancel_count",
+    "cleanup_class",
+    "owned_process_residue_count",
+    "pipe_residue_count",
+    "temporary_file_residue_count",
+}
+_HELPER_PRIVACY_FIELDS = {
+    "render_reference_published",
+    "raw_pcm_published",
+    "raw_audio_persisted",
+    "transcript_observed",
+    "pipe_name_published",
+    "process_or_device_identity_published",
+    "private_path_published",
+    "payload_published",
+}
+_HELPER_AUTHORITY_FIELDS = {
+    "exactly_one_aec_owner",
+    "render_reference_turn_input_authority",
+    "processed_near_end_turn_input_authority",
+    "thought_core_turn_input_authority",
+    "user_heard_authority",
+    "readiness_authority",
+}
+_HELPER_DOES_NOT_PROVE = [
+    "live_barge_in",
+    "self_output_turn_input_blocking",
+    "genuine_user_speech_acceptance",
+    "aec_effectiveness",
+    "subjective_audio_quality",
+    "user_heard_audio",
+    "release_readiness",
+]
+
+
+def _build_live_near_end_evidence_boundary() -> tuple[Any, Any]:
+    owner = object()
+
+    class _LiveNearEndDiscriminationEvidence:
+        __slots__ = (
+            "_owner",
+            "_identity",
+            "_classification",
+            "_source_epoch_binding",
+            "_consumed",
+        )
+
+        def __new__(
+            cls,
+            classification: str,
+            source_epoch_binding: object,
+            mint_token: object,
+        ) -> object:
+            if mint_token is not owner:
+                raise TypeError("live near-end evidence is producer-owned")
+            return super().__new__(cls)
+
+        def __init__(
+            self,
+            classification: str,
+            source_epoch_binding: object,
+            mint_token: object,
+        ) -> None:
+            if mint_token is not owner:
+                raise TypeError("live near-end evidence is producer-owned")
+            self._owner = owner
+            self._identity = object()
+            self._classification = classification
+            self._source_epoch_binding = source_epoch_binding
+            self._consumed = False
+
+        def __repr__(self) -> str:
+            return "<live-near-end-discrimination-evidence private>"
+
+        __str__ = __repr__
+
+        def __bool__(self) -> bool:
+            raise TypeError("live near-end evidence has no boolean representation")
+
+        def __copy__(self) -> object:
+            raise TypeError("live near-end evidence cannot be copied")
+
+        def __deepcopy__(self, memo: object) -> object:
+            del memo
+            raise TypeError("live near-end evidence cannot be copied")
+
+        def __reduce__(self) -> object:
+            raise TypeError("live near-end evidence cannot be serialized")
+
+        def __reduce_ex__(self, protocol: int) -> object:
+            del protocol
+            raise TypeError("live near-end evidence cannot be serialized")
+
+    def mint(classification: str, source_epoch_binding: object) -> object:
+        if classification not in {
+            NEAR_END_DISTINGUISHED_CLASS,
+            SELF_OUTPUT_OR_AMBIGUOUS_CLASS,
+        }:
+            raise LiveAecCaptureError("live_aec_helper_result_invalid")
+        return _LiveNearEndDiscriminationEvidence(
+            classification,
+            source_epoch_binding,
+            owner,
+        )
+
+    def consume(evidence: object, source_epoch_binding: object) -> str | None:
+        if type(evidence) is not _LiveNearEndDiscriminationEvidence:
+            return None
+        if (
+            evidence._owner is not owner
+            or evidence._consumed
+            or evidence._source_epoch_binding is not source_epoch_binding
+        ):
+            return None
+        evidence._consumed = True
+        classification = evidence._classification
+        evidence._classification = SELF_OUTPUT_OR_AMBIGUOUS_CLASS
+        evidence._source_epoch_binding = None
+        return classification
+
+    return mint, consume
+
+
+(
+    _new_live_near_end_discrimination_evidence,
+    _consume_live_near_end_discrimination_evidence,
+) = _build_live_near_end_evidence_boundary()
 
 
 class AecReferenceError(ValueError):
@@ -110,6 +278,7 @@ class LiveAecProcessedCapture:
     storage_class: str = "in_memory_ephemeral"
     turn_input_authority: bool = False
     turn_input_authority_class: str = "processed_near_end_observation_only"
+    near_end_discrimination_evidence: object | None = None
 
     @property
     def processed_byte_count(self) -> int:
@@ -173,6 +342,7 @@ def capture_live_aec_processed_pcm(
     window_ms: int,
     deadline_ms: int,
     processing_mode_class: str = LIVE_CAPTURE_MODE_AEC,
+    source_epoch_binding: object | None = None,
     helper_path: Path | None = None,
     popen_factory: Any = subprocess.Popen,
     server_factory: Any = None,
@@ -296,15 +466,30 @@ def capture_live_aec_processed_pcm(
         packet_count = raw_packet_count
         helper_packet_count = helper_result["observation"]["packet_count"]
         helper_byte_count = helper_result["observation"]["processed_byte_count"]
+        helper_window_ms = helper_result["observation"]["window_ms"]
+        helper_live_capture_used = helper_result["observation"][
+            "live_capture_used"
+        ]
         if helper_packet_count != packet_count:
             _clear_bytearray(pcm16)
             raise LiveAecCaptureError("live_aec_count_mismatch")
         if helper_byte_count != len(pcm16):
             _clear_bytearray(pcm16)
             raise LiveAecCaptureError("live_aec_count_mismatch")
+        if helper_window_ms != window_ms or helper_live_capture_used is not True:
+            _clear_bytearray(pcm16)
+            raise LiveAecCaptureError("live_aec_helper_result_invalid")
         capture = LiveAecProcessedCapture(
             pcm16=pcm16,
             packet_count=packet_count,
+            near_end_discrimination_evidence=(
+                _new_live_near_end_discrimination_evidence(
+                    helper_result["observation"][
+                        "near_end_discrimination_class"
+                    ],
+                    source_epoch_binding,
+                )
+            ),
         )
         server_pcm = None
         return capture
@@ -386,23 +571,178 @@ def _parse_helper_class_only_result(raw: bytearray) -> dict[str, Any]:
         payload = json.loads(bytes(raw).decode("utf-8"))
     except Exception:
         raise LiveAecCaptureError("live_aec_helper_result_invalid") from None
-    if not isinstance(payload, dict):
-        raise LiveAecCaptureError("live_aec_helper_result_invalid")
-    if payload.get("schema_version") != "voice_capture_dsp_aec_observation.v0":
+    if not isinstance(payload, dict) or set(payload) != _HELPER_TOP_LEVEL_FIELDS:
         raise LiveAecCaptureError("live_aec_helper_result_invalid")
     observation = payload.get("observation")
-    if not isinstance(observation, dict):
+    lifecycle = payload.get("lifecycle")
+    privacy = payload.get("privacy")
+    authority = payload.get("authority")
+    if (
+        payload.get("schema_version")
+        != "voice_capture_dsp_aec_observation.v0"
+        or not isinstance(observation, dict)
+        or set(observation) != _HELPER_OBSERVATION_FIELDS
+        or not isinstance(lifecycle, dict)
+        or set(lifecycle) != _HELPER_LIFECYCLE_FIELDS
+        or not isinstance(privacy, dict)
+        or set(privacy) != _HELPER_PRIVACY_FIELDS
+        or not isinstance(authority, dict)
+        or set(authority) != _HELPER_AUTHORITY_FIELDS
+        or payload.get("does_not_prove") != _HELPER_DOES_NOT_PROVE
+    ):
+        raise LiveAecCaptureError("live_aec_helper_result_invalid")
+    result_class = payload.get("result_class")
+    capability_class = payload.get("capability_class")
+    live_capture_used = observation.get("live_capture_used")
+    if (
+        not isinstance(result_class, str)
+        or not 1 <= len(result_class) <= 96
+        or any(
+            not (character.islower() or character.isdigit() or character == "_")
+            for character in result_class
+        )
+        or capability_class
+        not in {
+            "not_checked",
+            "voice_capture_dsp_capability_available",
+            "voice_capture_dsp_unsupported_platform",
+        }
+        or payload.get("owner_class") != "windows_voice_capture_dsp"
+        or payload.get("source_class")
+        != "windows_voice_capture_dsp_source_mode"
+        or not isinstance(live_capture_used, bool)
+        or payload.get("proof_ceiling")
+        != (
+            "local_windows_voice_capture_dsp_reachability_only"
+            if live_capture_used
+            else "source_static_live_aec_adapter_contract"
+        )
+        or any(value is not False for value in privacy.values())
+        or not isinstance(authority.get("exactly_one_aec_owner"), bool)
+        or any(
+            authority[field] is not False
+            for field in _HELPER_AUTHORITY_FIELDS
+            if field != "exactly_one_aec_owner"
+        )
+    ):
         raise LiveAecCaptureError("live_aec_helper_result_invalid")
     packet_count = observation.get("packet_count")
     byte_count = observation.get("processed_byte_count")
+    window_ms = observation.get("window_ms")
+    classification = observation.get("near_end_discrimination_class")
+    attempt_count = observation.get("quality_metrics_attempt_count")
+    valid_count = observation.get("quality_metrics_valid_count")
+    trusted_count = observation.get("quality_metrics_trusted_count")
+    ambiguous_count = observation.get("quality_metrics_ambiguous_count")
+    cleanup_failure_count = observation.get(
+        "quality_metrics_cleanup_failure_count"
+    )
+    observation_counts = (
+        window_ms,
+        packet_count,
+        byte_count,
+        attempt_count,
+        valid_count,
+        trusted_count,
+        ambiguous_count,
+        cleanup_failure_count,
+    )
+    lifecycle_count_fields = _HELPER_LIFECYCLE_FIELDS - {
+        "cleanup_class",
+        "owned_process_residue_count",
+        "pipe_residue_count",
+        "temporary_file_residue_count",
+    }
+    lifecycle_counts = tuple(lifecycle[field] for field in lifecycle_count_fields)
+    residue = tuple(
+        lifecycle[field]
+        for field in (
+            "owned_process_residue_count",
+            "pipe_residue_count",
+            "temporary_file_residue_count",
+        )
+    )
     if (
-        isinstance(packet_count, bool)
-        or not isinstance(packet_count, int)
-        or packet_count < 0
-        or isinstance(byte_count, bool)
-        or not isinstance(byte_count, int)
-        or byte_count < 0
+        any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in observation_counts + lifecycle_counts
+        )
         or byte_count != packet_count * LIVE_AEC_FRAME_BYTES
+        or classification
+        not in {
+            NEAR_END_DISTINGUISHED_CLASS,
+            SELF_OUTPUT_OR_AMBIGUOUS_CLASS,
+        }
+        or lifecycle.get("cleanup_class")
+        not in {
+            "route_owned_cleanup_clear",
+            "no_runtime_started",
+            "cleanup_not_proven",
+        }
+        or any(
+            value is not None
+            and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value != 0
+            )
+            for value in residue
+        )
+        or (
+            lifecycle.get("cleanup_class") == "cleanup_not_proven"
+            and any(value is not None for value in residue)
+        )
+        or (
+            lifecycle.get("cleanup_class") != "cleanup_not_proven"
+            and any(value != 0 for value in residue)
+        )
+    ):
+        raise LiveAecCaptureError("live_aec_helper_result_invalid")
+    if result_class in {
+        "processed_near_end_pcm_observed",
+        "processed_near_end_silence_observed",
+    }:
+        if (
+            not 100 <= window_ms <= 5000
+            or attempt_count != packet_count
+            or valid_count > attempt_count
+            or trusted_count > valid_count
+            or trusted_count + ambiguous_count != attempt_count
+            or cleanup_failure_count != 0
+            or live_capture_used is not True
+            or capability_class != "voice_capture_dsp_capability_available"
+            or authority.get("exactly_one_aec_owner") is not True
+            or lifecycle.get("cleanup_class") != "route_owned_cleanup_clear"
+            or any(value != 0 for value in residue)
+        ):
+            raise LiveAecCaptureError("live_aec_helper_result_invalid")
+        expected_classification = (
+            NEAR_END_DISTINGUISHED_CLASS
+            if packet_count > 0
+            and valid_count == attempt_count
+            and trusted_count == attempt_count
+            and ambiguous_count == 0
+            else SELF_OUTPUT_OR_AMBIGUOUS_CLASS
+        )
+        if classification != expected_classification:
+            raise LiveAecCaptureError("live_aec_helper_result_invalid")
+    elif (
+        live_capture_used is not False
+        or window_ms != 0
+        or packet_count != 0
+        or byte_count != 0
+        or classification != SELF_OUTPUT_OR_AMBIGUOUS_CLASS
+        or any(
+            value != 0
+            for value in (
+                attempt_count,
+                valid_count,
+                trusted_count,
+                ambiguous_count,
+                cleanup_failure_count,
+            )
+        )
+        or authority.get("exactly_one_aec_owner") is not False
     ):
         raise LiveAecCaptureError("live_aec_helper_result_invalid")
     return payload

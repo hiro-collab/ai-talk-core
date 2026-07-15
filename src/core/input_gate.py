@@ -14,6 +14,10 @@ from typing import Any, Mapping
 
 LIVE_CAPTURE_MODE_AEC = "windows_voice_capture_dsp_aec"
 LIVE_CAPTURE_MODE_NS_AGC = "windows_voice_capture_dsp_ns_agc"
+NEAR_END_DISTINGUISHED_CLASS = (
+    "near_end_speech_distinguished_from_active_self_output"
+)
+SELF_OUTPUT_OR_AMBIGUOUS_CLASS = "self_output_or_ambiguous"
 
 
 class InputGateError(ValueError):
@@ -147,6 +151,9 @@ class _InputSourceEpoch:
         "_lifecycle_state_at_capture",
         "_capture_started_monotonic",
         "_deadline_monotonic",
+        "_near_end_discrimination_class",
+        "_evaluation_consumed",
+        "_retired",
     )
 
     def __init__(
@@ -165,6 +172,9 @@ class _InputSourceEpoch:
         self._lifecycle_state_at_capture = lifecycle.lifecycle_state
         self._capture_started_monotonic = capture_started_monotonic
         self._deadline_monotonic = deadline_monotonic
+        self._near_end_discrimination_class: str | None = None
+        self._evaluation_consumed = False
+        self._retired = False
 
     def __repr__(self) -> str:
         return "<input-source-epoch private>"
@@ -746,6 +756,64 @@ class InputGate:
                 else LIVE_CAPTURE_MODE_AEC
             )
 
+    def observe_live_near_end_discrimination(
+        self,
+        source_epoch: object,
+        producer_evidence: object,
+    ) -> bool:
+        """Consume one producer-owned observation for the exact source epoch."""
+        if type(source_epoch) is not _InputSourceEpoch:
+            return False
+        with self._lock:
+            if (
+                not self._source_epoch_is_current_locked(source_epoch)
+                or source_epoch._near_end_discrimination_class is not None
+                or source_epoch._evaluation_consumed
+            ):
+                return False
+            from src.io.aec_reference import (
+                _consume_live_near_end_discrimination_evidence,
+            )
+
+            discrimination_class = (
+                _consume_live_near_end_discrimination_evidence(
+                    producer_evidence,
+                    source_epoch,
+                )
+            )
+            if discrimination_class not in {
+                NEAR_END_DISTINGUISHED_CLASS,
+                SELF_OUTPUT_OR_AMBIGUOUS_CLASS,
+            } or (
+                source_epoch._lifecycle_state_at_capture == "released"
+                and discrimination_class != SELF_OUTPUT_OR_AMBIGUOUS_CLASS
+            ):
+                return False
+            source_epoch._near_end_discrimination_class = discrimination_class
+            return True
+
+    def retire_live_input_source_epoch(self, source_epoch: object) -> bool:
+        """Retire one exact gate-owned source epoch after its bounded window."""
+        if type(source_epoch) is not _InputSourceEpoch:
+            return False
+        with self._lock:
+            if (
+                source_epoch._owner is not self._source_epoch_owner
+                or source_epoch._retired
+                or any(
+                    pending.source_epoch is source_epoch
+                    for pending in self._pending.values()
+                )
+                or any(
+                    epoch is source_epoch
+                    for epoch in self._candidate_source_epochs.values()
+                )
+            ):
+                return False
+            source_epoch._near_end_discrimination_class = None
+            source_epoch._retired = True
+            return True
+
     def evaluate_live_processed_candidate(
         self,
         *,
@@ -782,6 +850,12 @@ class InputGate:
                 return None
             if using_epoch:
                 if (
+                    not self._source_epoch_is_current_locked(epoch)
+                    or epoch._evaluation_consumed
+                ):
+                    return None
+                epoch._evaluation_consumed = True
+                if (
                     isinstance(speech_end_monotonic, bool)
                     or not isinstance(speech_end_monotonic, (int, float))
                     or not math.isfinite(float(speech_end_monotonic))
@@ -795,10 +869,24 @@ class InputGate:
                     "handoff_accepted",
                     "cooldown",
                 }
+                near_end_discrimination_class = (
+                    epoch._near_end_discrimination_class
+                )
             else:
                 if lifecycle.lifecycle_state != "released":
                     return None
                 overlap = False
+                near_end_discrimination_class = SELF_OUTPUT_OR_AMBIGUOUS_CLASS
+            if near_end_discrimination_class not in {
+                NEAR_END_DISTINGUISHED_CLASS,
+                SELF_OUTPUT_OR_AMBIGUOUS_CLASS,
+            }:
+                return None
+            if overlap:
+                if near_end_discrimination_class != NEAR_END_DISTINGUISHED_CLASS:
+                    return None
+            elif near_end_discrimination_class != SELF_OUTPUT_OR_AMBIGUOUS_CLASS:
+                return None
             candidate = UserSpeechCandidateEvidence(
                 candidate_id=f"ausc_live:cid_{secrets.token_hex(16)}",
                 source_kind="user_speech_candidate",
@@ -828,7 +916,7 @@ class InputGate:
                 post_compare_session_status="current_unchanged",
                 self_output_correlation_class="not_self_output",
                 active_session_exclusion_status=(
-                    "near_end_speech_distinguished_from_active_self_output"
+                    NEAR_END_DISTINGUISHED_CLASS
                     if overlap
                     else "explicitly_excluded_from_candidate"
                 ),
@@ -854,6 +942,7 @@ class InputGate:
         self_output = self._self_output
         return bool(
             epoch._owner is self._source_epoch_owner
+            and not epoch._retired
             and lifecycle is not None
             and self_output is not None
             and _lifecycle_lease_key(lifecycle)
@@ -1365,7 +1454,7 @@ def _candidate_matches_current_join(
         return False
     overlap_fields_match = (
         candidate.active_session_exclusion_status
-        == "near_end_speech_distinguished_from_active_self_output"
+        == NEAR_END_DISTINGUISHED_CLASS
         and candidate.cooldown_status == "overlap_current_lease"
     )
     independent_fields_match = (

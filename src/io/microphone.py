@@ -68,6 +68,7 @@ class LiveMicrophoneCandidateWindow:
     packet_count: int
     window_ms: int
     frame_bytes: int = 320
+    near_end_discrimination_evidence: object | None = None
 
     def __repr__(self) -> str:
         return "<live-microphone-candidate-window private-pcm>"
@@ -515,6 +516,7 @@ def capture_live_microphone_candidate_window(
     window_ms: int,
     deadline_ms: int,
     processing_mode_class: str = LIVE_CAPTURE_MODE_AEC,
+    source_epoch_binding: object | None = None,
     live_aec_capture: Callable[..., LiveAecProcessedCapture] = (
         capture_live_aec_processed_pcm
     ),
@@ -526,6 +528,7 @@ def capture_live_microphone_candidate_window(
             window_ms=window_ms,
             deadline_ms=deadline_ms,
             processing_mode_class=processing_mode_class,
+            source_epoch_binding=source_epoch_binding,
         )
     except LiveAecCaptureError as exc:
         raise AudioEnvironmentError(exc.failure_class) from None
@@ -543,6 +546,9 @@ def capture_live_microphone_candidate_window(
             chunk=chunk,
             packet_count=capture.packet_count,
             window_ms=window_ms,
+            near_end_discrimination_evidence=(
+                capture.near_end_discrimination_evidence
+            ),
         )
     except Exception:
         capture.clear()

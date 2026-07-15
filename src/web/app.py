@@ -854,6 +854,7 @@ def execute_live_candidate_window(
             window_ms=window_ms,
             deadline_ms=deadline_ms,
             processing_mode_class=processing_mode_class,
+            source_epoch_binding=source_epoch,
         )
         packet_count = capture_window.packet_count
         byte_count = capture_window.processed_byte_count
@@ -875,6 +876,10 @@ def execute_live_candidate_window(
             utterance_end_timing_class = "no_vad_speech_frame"
         vad_decision_class = (
             "speech_detected" if has_speech else "speech_not_detected"
+        )
+        input_gate.observe_live_near_end_discrimination(
+            source_epoch,
+            capture_window.near_end_discrimination_evidence,
         )
         candidate = input_gate.evaluate_live_processed_candidate(
             has_speech=has_speech,
@@ -1077,6 +1082,8 @@ def execute_live_candidate_window(
         if candidate is not None:
             input_gate.discard_consumed_candidate(candidate)
             input_gate.discard_candidate(candidate)
+        if source_epoch is not None:
+            input_gate.retire_live_input_source_epoch(source_epoch)
         private_authority_residue_count = (
             input_gate.private_authority_residue_count()
         )

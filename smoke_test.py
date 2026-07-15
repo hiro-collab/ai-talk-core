@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 import io
 import contextlib
 import copy
@@ -144,6 +145,7 @@ from src.web.app import (
     build_runtime_status_payload,
     build_input_gate_response,
     create_app,
+    execute_live_candidate_window,
     format_sse_event,
     get_recording_chunk_dir,
     parse_bearer_token,
@@ -352,6 +354,125 @@ def build_user_speech_candidate(
     }
     values.update(overrides)
     return UserSpeechCandidateEvidence(**values)  # type: ignore[arg-type]
+
+
+def build_live_aec_helper_result(
+    observation: Mapping[str, object],
+    *,
+    result_class: str = "processed_near_end_pcm_observed",
+) -> dict[str, object]:
+    """Mirror the exact class-only PowerShell wrapper shape in test fakes."""
+    live_capture_used = observation.get("live_capture_used") is True
+    packet_count = observation.get("packet_count")
+    success = result_class in {
+        "processed_near_end_pcm_observed",
+        "processed_near_end_silence_observed",
+    }
+    zero_or_packets = packet_count if isinstance(packet_count, int) else 0
+    return {
+        "schema_version": "voice_capture_dsp_aec_observation.v0",
+        "proof_ceiling": (
+            "local_windows_voice_capture_dsp_reachability_only"
+            if live_capture_used
+            else "source_static_live_aec_adapter_contract"
+        ),
+        "result_class": result_class,
+        "capability_class": "voice_capture_dsp_capability_available",
+        "owner_class": "windows_voice_capture_dsp",
+        "source_class": "windows_voice_capture_dsp_source_mode",
+        "observation": dict(observation),
+        "lifecycle": {
+            "backend_activate_count": 1 if success else 0,
+            "capture_start_count": 1 if success else 0,
+            "capture_stop_attempt_count": 1 if success else 0,
+            "capture_stop_count": 1 if success else 0,
+            "backend_resource_release_count": 1 if success else 0,
+            "sink_connect_count": 1 if success else 0,
+            "sink_write_count": zero_or_packets if success else 0,
+            "sink_release_count": 1 if success else 0,
+            "cancel_count": 0,
+            "cleanup_class": (
+                "route_owned_cleanup_clear" if success else "no_runtime_started"
+            ),
+            "owned_process_residue_count": 0,
+            "pipe_residue_count": 0,
+            "temporary_file_residue_count": 0,
+        },
+        "privacy": {
+            "render_reference_published": False,
+            "raw_pcm_published": False,
+            "raw_audio_persisted": False,
+            "transcript_observed": False,
+            "pipe_name_published": False,
+            "process_or_device_identity_published": False,
+            "private_path_published": False,
+            "payload_published": False,
+        },
+        "authority": {
+            "exactly_one_aec_owner": live_capture_used and success,
+            "render_reference_turn_input_authority": False,
+            "processed_near_end_turn_input_authority": False,
+            "thought_core_turn_input_authority": False,
+            "user_heard_authority": False,
+            "readiness_authority": False,
+        },
+        "does_not_prove": [
+            "live_barge_in",
+            "self_output_turn_input_blocking",
+            "genuine_user_speech_acceptance",
+            "aec_effectiveness",
+            "subjective_audio_quality",
+            "user_heard_audio",
+            "release_readiness",
+        ],
+    }
+
+
+def build_near_end_evidence(
+    source_epoch: object,
+    classification: str = (
+        "near_end_speech_distinguished_from_active_self_output"
+    ),
+) -> object:
+    """Use the private producer mint only to simulate validated capture tests."""
+    return aec_reference_module._new_live_near_end_discrimination_evidence(
+        classification,
+        source_epoch,
+    )
+
+
+def bind_live_candidate_window(
+    window: LiveMicrophoneCandidateWindow,
+    source_epoch: object,
+    *,
+    classification: str = "self_output_or_ambiguous",
+) -> LiveMicrophoneCandidateWindow:
+    """Bind a fake capture window to the exact gate epoch used by the route."""
+    return replace(
+        window,
+        near_end_discrimination_evidence=build_near_end_evidence(
+            source_epoch,
+            classification,
+        ),
+    )
+
+
+def bind_live_candidate_sequence(
+    windows: list[LiveMicrophoneCandidateWindow],
+    *,
+    classification: str = "self_output_or_ambiguous",
+):
+    """Return a deterministic fake capture that binds each window once."""
+    remaining = iter(windows)
+
+    def capture(**kwargs: object) -> LiveMicrophoneCandidateWindow:
+        return bind_live_candidate_window(
+            next(remaining),
+            kwargs["source_epoch_binding"],
+            classification=classification,
+        )
+
+    return capture
 
 
 def prepare_current_input_gate() -> InputGate:
@@ -815,7 +936,20 @@ class SmokeTests(unittest.TestCase):
         )
         created_servers = []
         created_processes = []
-        helper_observation = {"packet_count": 1, "processed_byte_count": 320}
+        helper_observation = {
+            "window_ms": 100,
+            "packet_count": 1,
+            "processed_byte_count": 320,
+            "near_end_discrimination_class": (
+                "near_end_speech_distinguished_from_active_self_output"
+            ),
+            "quality_metrics_attempt_count": 1,
+            "quality_metrics_valid_count": 1,
+            "quality_metrics_trusted_count": 1,
+            "quality_metrics_ambiguous_count": 0,
+            "quality_metrics_cleanup_failure_count": 0,
+            "live_capture_used": True,
+        }
 
         class FakePrivateStdin:
             def __init__(self) -> None:
@@ -857,11 +991,7 @@ class SmokeTests(unittest.TestCase):
                     value == 0 for value in self._private_stdin.buffer
                 )
                 self.returncode = 0
-                result = {
-                    "schema_version": "voice_capture_dsp_aec_observation.v0",
-                    "result_class": "processed_near_end_pcm_observed",
-                    "observation": dict(helper_observation),
-                }
+                result = build_live_aec_helper_result(helper_observation)
                 return json.dumps(result).encode("utf-8"), b""
 
             def poll(self):
@@ -906,6 +1036,7 @@ class SmokeTests(unittest.TestCase):
                 self.close_count += 1
 
         helper_path = Path(__file__)
+        source_epoch_binding = object()
         with (
             mock.patch(
                 "src.io.aec_reference._resolve_powershell_executable",
@@ -927,6 +1058,7 @@ class SmokeTests(unittest.TestCase):
                 helper_path=helper_path,
                 popen_factory=FakeProcess,
                 server_factory=FakeServer,
+                source_epoch_binding=source_epoch_binding,
             )
 
         process = created_processes[0]
@@ -959,22 +1091,107 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(capture.storage_class, "in_memory_ephemeral")
         self.assertEqual(capture.packet_count, 1)
         self.assertEqual(capture.processed_byte_count, 320)
+        self.assertEqual(
+            repr(capture.near_end_discrimination_evidence),
+            "<live-near-end-discrimination-evidence private>",
+        )
+        self.assertEqual(
+            aec_reference_module._consume_live_near_end_discrimination_evidence(
+                capture.near_end_discrimination_evidence,
+                source_epoch_binding,
+            ),
+            "near_end_speech_distinguished_from_active_self_output",
+        )
+        self.assertIsNone(
+            aec_reference_module._consume_live_near_end_discrimination_evidence(
+                capture.near_end_discrimination_evidence,
+                source_epoch_binding,
+            )
+        )
         self.assertTrue(any(value != 0 for value in capture.pcm16))
         capture.clear()
         self.assertTrue(all(value == 0 for value in capture.pcm16))
+
+        valid_helper_payload = build_live_aec_helper_result(helper_observation)
+        parsed = aec_reference_module._parse_helper_class_only_result(
+            bytearray(json.dumps(valid_helper_payload).encode("utf-8"))
+        )
+        self.assertEqual(
+            parsed["observation"]["near_end_discrimination_class"],
+            "near_end_speech_distinguished_from_active_self_output",
+        )
+        invalid_observations = []
+        unsafe = dict(helper_observation)
+        unsafe.update(
+            quality_metrics_trusted_count=0,
+            quality_metrics_ambiguous_count=1,
+        )
+        invalid_observations.append(unsafe)
+        missing = dict(helper_observation)
+        missing.pop("quality_metrics_valid_count")
+        invalid_observations.append(missing)
+        leaked = dict(helper_observation)
+        leaked["private_metric_blob"] = "private-marker"
+        invalid_observations.append(leaked)
+        cleanup_failed = dict(helper_observation)
+        cleanup_failed.update(
+            quality_metrics_trusted_count=0,
+            quality_metrics_ambiguous_count=1,
+            quality_metrics_cleanup_failure_count=1,
+        )
+        invalid_observations.append(cleanup_failed)
+        for observation in invalid_observations:
+            payload = dict(valid_helper_payload)
+            payload["observation"] = observation
+            with self.assertRaisesRegex(
+                LiveAecCaptureError,
+                "^live_aec_helper_result_invalid$",
+            ):
+                aec_reference_module._parse_helper_class_only_result(
+                    bytearray(json.dumps(payload).encode("utf-8"))
+                )
+
+        invalid_envelopes = []
+        leaked_top_level = copy.deepcopy(valid_helper_payload)
+        leaked_top_level["private_marker"] = "private-marker"
+        invalid_envelopes.append(leaked_top_level)
+        for nested_field in ("lifecycle", "privacy", "authority"):
+            leaked_nested = copy.deepcopy(valid_helper_payload)
+            leaked_nested[nested_field]["private_marker"] = "private-marker"
+            invalid_envelopes.append(leaked_nested)
+        wrong_non_claims = copy.deepcopy(valid_helper_payload)
+        wrong_non_claims["does_not_prove"].append("private-marker")
+        invalid_envelopes.append(wrong_non_claims)
+        for payload in invalid_envelopes:
+            with self.assertRaisesRegex(
+                LiveAecCaptureError,
+                "^live_aec_helper_result_invalid$",
+            ):
+                aec_reference_module._parse_helper_class_only_result(
+                    bytearray(json.dumps(payload).encode("utf-8"))
+                )
 
         class ZeroPacketProcess(FakeProcess):
             def communicate(self, timeout: float):
                 del timeout
                 self.returncode = 0
-                result = {
-                    "schema_version": "voice_capture_dsp_aec_observation.v0",
-                    "result_class": "processed_near_end_silence_observed",
-                    "observation": {
+                result = build_live_aec_helper_result(
+                    {
+                        "window_ms": 100,
                         "packet_count": 0,
                         "processed_byte_count": 0,
+                        "near_end_discrimination_class": (
+                            "self_output_or_ambiguous"
+                        ),
+                        "quality_metrics_attempt_count": 0,
+                        "quality_metrics_valid_count": 0,
+                        "quality_metrics_trusted_count": 0,
+                        "quality_metrics_ambiguous_count": 0,
+                        "quality_metrics_cleanup_failure_count": 0,
+                        "live_capture_used": True,
                     },
-                }
+                    result_class="processed_near_end_silence_observed",
+                )
                 return json.dumps(result).encode("utf-8"), b""
 
         class ZeroPacketServer(FakeServer):
@@ -1014,7 +1231,13 @@ class SmokeTests(unittest.TestCase):
                 processing_mode_class="caller_selected_user_intent",
             )
 
-        helper_observation.update(packet_count=2, processed_byte_count=640)
+        helper_observation.update(
+            packet_count=2,
+            processed_byte_count=640,
+            quality_metrics_attempt_count=2,
+            quality_metrics_valid_count=2,
+            quality_metrics_trusted_count=2,
+        )
         with (
             mock.patch("src.io.aec_reference._resolve_powershell_executable", return_value="pwsh"),
             mock.patch("src.io.aec_reference._current_process_creation_utc_ticks", return_value=123),
@@ -1069,7 +1292,13 @@ class SmokeTests(unittest.TestCase):
 
         fixed_nonce = bytes(range(32))
         fixed_digest = aec_reference_module.hashlib.sha256(fixed_nonce).digest()
-        helper_observation.update(packet_count=1, processed_byte_count=320)
+        helper_observation.update(
+            packet_count=1,
+            processed_byte_count=320,
+            quality_metrics_attempt_count=1,
+            quality_metrics_valid_count=1,
+            quality_metrics_trusted_count=1,
+        )
         with (
             mock.patch("src.io.aec_reference.secrets.token_bytes", return_value=fixed_nonce),
             mock.patch("src.io.aec_reference._resolve_powershell_executable", return_value="pwsh"),
@@ -5189,14 +5418,23 @@ class SmokeTests(unittest.TestCase):
 
                 def communicate(self, timeout: float) -> tuple[bytes, bytes]:
                     del timeout
-                    result = {
-                        "schema_version": "voice_capture_dsp_aec_observation.v0",
-                        "result_class": result_class,
-                        "observation": {
+                    result = build_live_aec_helper_result(
+                        {
+                            "window_ms": 0,
                             "packet_count": 0,
                             "processed_byte_count": 0,
+                            "near_end_discrimination_class": (
+                                "self_output_or_ambiguous"
+                            ),
+                            "quality_metrics_attempt_count": 0,
+                            "quality_metrics_valid_count": 0,
+                            "quality_metrics_trusted_count": 0,
+                            "quality_metrics_ambiguous_count": 0,
+                            "quality_metrics_cleanup_failure_count": 0,
+                            "live_capture_used": False,
                         },
-                    }
+                        result_class=result_class,
+                    )
                     return json.dumps(result).encode(), private_marker.encode()
 
                 def poll(self) -> int:
@@ -5210,7 +5448,7 @@ class SmokeTests(unittest.TestCase):
         )
         for result_class, expected in (
             ("voice_capture_dsp_start_failed", "voice_capture_dsp_start_failed"),
-            (private_marker, "live_aec_helper_failed"),
+            (private_marker, "live_aec_helper_result_invalid"),
         ):
             with self.subTest(result_class=result_class):
                 with (
@@ -5319,7 +5557,15 @@ class SmokeTests(unittest.TestCase):
 
         def fake_capture(**kwargs: object) -> LiveAecProcessedCapture:
             observed.update(kwargs)
-            return LiveAecProcessedCapture(pcm16=pcm, packet_count=1)
+            return LiveAecProcessedCapture(
+                pcm16=pcm,
+                packet_count=1,
+                near_end_discrimination_evidence=(
+                    build_near_end_evidence(
+                        kwargs.get("source_epoch_binding"),
+                    )
+                ),
+            )
 
         window = capture_live_microphone_candidate_window(
             window_ms=100,
@@ -5336,6 +5582,13 @@ class SmokeTests(unittest.TestCase):
         )
         self.assertEqual(window.packet_count, 1)
         self.assertEqual(window.processed_byte_count, 320)
+        self.assertEqual(
+            aec_reference_module._consume_live_near_end_discrimination_evidence(
+                window.near_end_discrimination_evidence,
+                None,
+            ),
+            "near_end_speech_distinguished_from_active_self_output",
+        )
         self.assertEqual(repr(window), "<live-microphone-candidate-window private-pcm>")
         window.clear()
         self.assertEqual(pcm, bytearray(len(pcm)))
@@ -5454,6 +5707,29 @@ class SmokeTests(unittest.TestCase):
             build_system_speech_lifecycle("handoff_accepted"),
         )
         gate.observe_self_output_observation(build_self_output_observation())
+        missing_epoch = gate.begin_live_input_source_epoch(
+            capture_started_monotonic=100.0,
+            deadline_ms=1000,
+        )
+        self.assertIsNotNone(missing_epoch)
+        self.assertIsNone(
+            gate.evaluate_live_processed_candidate(
+                has_speech=True,
+                window_ms=100,
+                packet_count=1,
+                processed_byte_count=320,
+                frame_bytes=320,
+                source_epoch=missing_epoch,
+                speech_end_monotonic=100.05,
+            )
+        )
+        self.assertFalse(
+            gate.observe_live_near_end_discrimination(
+                missing_epoch,
+                build_near_end_evidence(missing_epoch),
+            )
+        )
+        self.assertTrue(gate.retire_live_input_source_epoch(missing_epoch))
         epoch = gate.begin_live_input_source_epoch(
             capture_started_monotonic=100.0,
             deadline_ms=1000,
@@ -5473,6 +5749,35 @@ class SmokeTests(unittest.TestCase):
         self.assertIsNone(
             gate.live_input_source_epoch_processing_mode(object())
         )
+        self.assertFalse(
+            gate.observe_live_near_end_discrimination(
+                epoch,
+                "caller_selected_user_intent",
+            )
+        )
+        evidence = build_near_end_evidence(epoch)
+        self.assertEqual(
+            repr(evidence),
+            "<live-near-end-discrimination-evidence private>",
+        )
+        with self.assertRaises(TypeError):
+            bool(evidence)
+        with self.assertRaises(TypeError):
+            copy.copy(evidence)
+        with self.assertRaises(TypeError):
+            pickle.dumps(evidence)
+        self.assertTrue(
+            gate.observe_live_near_end_discrimination(
+                epoch,
+                evidence,
+            )
+        )
+        self.assertFalse(
+            gate.observe_live_near_end_discrimination(
+                epoch,
+                evidence,
+            )
+        )
         candidate = gate.evaluate_live_processed_candidate(
             has_speech=True,
             window_ms=100,
@@ -5484,12 +5789,37 @@ class SmokeTests(unittest.TestCase):
         )
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate.cooldown_status, "overlap_current_lease")
+        self.assertIsNone(
+            gate.evaluate_live_processed_candidate(
+                has_speech=True,
+                window_ms=100,
+                packet_count=1,
+                processed_byte_count=320,
+                frame_bytes=320,
+                source_epoch=epoch,
+                speech_end_monotonic=100.06,
+            )
+        )
+        replay_epoch = gate.begin_live_input_source_epoch(
+            capture_started_monotonic=100.0,
+            deadline_ms=1000,
+        )
+        self.assertIsNotNone(replay_epoch)
+        self.assertFalse(
+            gate.observe_live_near_end_discrimination(
+                replay_epoch,
+                evidence,
+            )
+        )
+        self.assertTrue(gate.retire_live_input_source_epoch(replay_epoch))
         capability = gate.issue_turn_input_capability(candidate)
         self.assertIsNotNone(capability)
         self.assertTrue(
             gate.consume_turn_input_capability(capability, candidate)
         )
         self.assertIsNotNone(gate.build_consumed_candidate_audit(candidate))
+        self.assertTrue(gate.retire_live_input_source_epoch(epoch))
+        self.assertFalse(gate.retire_live_input_source_epoch(epoch))
         self.assertEqual(gate.private_authority_residue_count(), 0)
 
     def test_overlap_epoch_release_stale_generation_and_disabled_fail_closed(self) -> None:
@@ -5557,6 +5887,95 @@ class SmokeTests(unittest.TestCase):
             )
         )
 
+    def test_overlap_source_epoch_allows_exactly_one_concurrent_evaluation(self) -> None:
+        """Concurrent callbacks cannot create two candidates from one epoch."""
+        gate = InputGate()
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("handoff_accepted"),
+        )
+        gate.observe_self_output_observation(build_self_output_observation())
+        epoch = gate.begin_live_input_source_epoch(
+            capture_started_monotonic=100.0,
+            deadline_ms=1000,
+        )
+        self.assertIsNotNone(epoch)
+        self.assertTrue(
+            gate.observe_live_near_end_discrimination(
+                epoch,
+                build_near_end_evidence(epoch),
+            )
+        )
+        barrier = threading.Barrier(3)
+        results: list[UserSpeechCandidateEvidence | None] = []
+
+        def evaluate() -> None:
+            barrier.wait()
+            results.append(
+                gate.evaluate_live_processed_candidate(
+                    has_speech=True,
+                    window_ms=100,
+                    packet_count=1,
+                    processed_byte_count=320,
+                    frame_bytes=320,
+                    source_epoch=epoch,
+                    speech_end_monotonic=100.05,
+                )
+            )
+
+        threads = [threading.Thread(target=evaluate) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+        candidates = [result for result in results if result is not None]
+        self.assertEqual(len(candidates), 1)
+        self.assertTrue(gate.discard_candidate(candidates[0]))
+        self.assertTrue(gate.retire_live_input_source_epoch(epoch))
+        self.assertEqual(gate.private_authority_residue_count(), 0)
+
+    def test_overlap_ambiguous_observation_cannot_be_upgraded(self) -> None:
+        """One private epoch keeps its first fixed producer observation."""
+        gate = InputGate()
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("handoff_accepted"),
+        )
+        gate.observe_self_output_observation(build_self_output_observation())
+        epoch = gate.begin_live_input_source_epoch(
+            capture_started_monotonic=100.0,
+            deadline_ms=1000,
+        )
+        self.assertIsNotNone(epoch)
+        self.assertTrue(
+            gate.observe_live_near_end_discrimination(
+                epoch,
+                build_near_end_evidence(
+                    epoch,
+                    "self_output_or_ambiguous",
+                ),
+            )
+        )
+        self.assertFalse(
+            gate.observe_live_near_end_discrimination(
+                epoch,
+                build_near_end_evidence(epoch),
+            )
+        )
+        self.assertIsNone(
+            gate.evaluate_live_processed_candidate(
+                has_speech=True,
+                window_ms=100,
+                packet_count=1,
+                processed_byte_count=320,
+                frame_bytes=320,
+                source_epoch=epoch,
+                speech_end_monotonic=100.05,
+            )
+        )
+
     def test_overlap_epoch_allows_speech_that_ended_before_same_lease_release(self) -> None:
         """A later same-lease release does not erase a completed overlap."""
         gate = InputGate()
@@ -5582,6 +6001,12 @@ class SmokeTests(unittest.TestCase):
                 build_system_speech_lifecycle("released"),
                 wall_timestamp="2026-07-13T12:00:02.000Z",
             )
+        self.assertTrue(
+            gate.observe_live_near_end_discrimination(
+                epoch,
+                build_near_end_evidence(epoch),
+            )
+        )
         candidate = gate.evaluate_live_processed_candidate(
             has_speech=True,
             window_ms=100,
@@ -5649,6 +6074,12 @@ class SmokeTests(unittest.TestCase):
             deadline_ms=1000,
         )
         self.assertIsNotNone(current_epoch)
+        self.assertTrue(
+            gate.observe_live_near_end_discrimination(
+                current_epoch,
+                build_near_end_evidence(current_epoch),
+            )
+        )
         current_candidate = gate.evaluate_live_processed_candidate(
             has_speech=True,
             window_ms=100,
@@ -5946,7 +6377,9 @@ class SmokeTests(unittest.TestCase):
         with (
             mock.patch(
                 "src.web.app.capture_live_microphone_candidate_window",
-                side_effect=[make_window(value) for value in pcm_values],
+                side_effect=bind_live_candidate_sequence(
+                    [make_window(value) for value in pcm_values]
+                ),
             ),
             mock.patch(
                 "src.web.app.has_detectable_speech_pcm16",
@@ -6045,7 +6478,10 @@ class SmokeTests(unittest.TestCase):
         with (
             mock.patch(
                 "src.web.app.capture_live_microphone_candidate_window",
-                return_value=capture_window,
+                side_effect=lambda **kwargs: bind_live_candidate_window(
+                    capture_window,
+                    kwargs["source_epoch_binding"],
+                ),
             ) as capture_mock,
             mock.patch(
                 "src.web.app.has_detectable_speech_pcm16",
@@ -6074,6 +6510,7 @@ class SmokeTests(unittest.TestCase):
             window_ms=100,
             deadline_ms=1000,
             processing_mode_class=LIVE_CAPTURE_MODE_NS_AGC,
+            source_epoch_binding=mock.ANY,
         )
         payload = response.get_json()
         self.assertEqual(
@@ -6220,7 +6657,13 @@ class SmokeTests(unittest.TestCase):
         with (
             mock.patch(
                 "src.web.app.capture_live_microphone_candidate_window",
-                return_value=capture_window,
+                side_effect=lambda **kwargs: bind_live_candidate_window(
+                    capture_window,
+                    kwargs["source_epoch_binding"],
+                    classification=(
+                        "near_end_speech_distinguished_from_active_self_output"
+                    ),
+                ),
             ) as capture_mock,
             mock.patch(
                 "src.web.app.has_detectable_speech_pcm16",
@@ -6259,6 +6702,7 @@ class SmokeTests(unittest.TestCase):
             window_ms=100,
             deadline_ms=1000,
             processing_mode_class=LIVE_CAPTURE_MODE_AEC,
+            source_epoch_binding=mock.ANY,
         )
         self.assertEqual(payload["thought_core_turninput_count"], 1)
         self.assertEqual(payload["private_authority_residue_count"], 0)
@@ -6300,7 +6744,10 @@ class SmokeTests(unittest.TestCase):
         with (
             mock.patch(
                 "src.web.app.capture_live_microphone_candidate_window",
-                return_value=capture_window,
+                side_effect=lambda **kwargs: bind_live_candidate_window(
+                    capture_window,
+                    kwargs["source_epoch_binding"],
+                ),
             ) as capture_mock,
             mock.patch(
                 "src.web.app.has_detectable_speech_pcm16",
@@ -6332,6 +6779,7 @@ class SmokeTests(unittest.TestCase):
             window_ms=100,
             deadline_ms=1000,
             processing_mode_class=LIVE_CAPTURE_MODE_AEC,
+            source_epoch_binding=mock.ANY,
         )
         self.assertEqual(pcm, bytearray(len(pcm)))
         sink.assert_not_called()
@@ -6380,7 +6828,10 @@ class SmokeTests(unittest.TestCase):
         with (
             mock.patch(
                 "src.web.app.capture_live_microphone_candidate_window",
-                return_value=capture_window,
+                side_effect=lambda **kwargs: bind_live_candidate_window(
+                    capture_window,
+                    kwargs["source_epoch_binding"],
+                ),
             ),
             mock.patch(
                 "src.web.app.has_detectable_speech_pcm16",
@@ -6455,7 +6906,10 @@ class SmokeTests(unittest.TestCase):
         with (
             mock.patch(
                 "src.web.app.capture_live_microphone_candidate_window",
-                return_value=capture_window,
+                side_effect=lambda **kwargs: bind_live_candidate_window(
+                    capture_window,
+                    kwargs["source_epoch_binding"],
+                ),
             ),
             mock.patch(
                 "src.web.app.has_detectable_speech_pcm16",
@@ -6651,7 +7105,10 @@ class SmokeTests(unittest.TestCase):
                 with (
                     mock.patch(
                         "src.web.app.capture_live_microphone_candidate_window",
-                        return_value=capture_window,
+                        side_effect=lambda **kwargs: bind_live_candidate_window(
+                            capture_window,
+                            kwargs["source_epoch_binding"],
+                        ),
                     ),
                     mock.patch(
                         "src.web.app.has_detectable_speech_pcm16",
@@ -6730,7 +7187,10 @@ class SmokeTests(unittest.TestCase):
                 with (
                     mock.patch(
                         "src.web.app.capture_live_microphone_candidate_window",
-                        return_value=capture_window,
+                        side_effect=lambda **kwargs: bind_live_candidate_window(
+                            capture_window,
+                            kwargs["source_epoch_binding"],
+                        ),
                     ),
                     mock.patch(
                         "src.web.app.has_detectable_speech_pcm16",
@@ -6824,7 +7284,9 @@ class SmokeTests(unittest.TestCase):
         with (
             mock.patch(
                 "src.web.app.capture_live_microphone_candidate_window",
-                side_effect=[make_window(value) for value in pcm_values],
+                side_effect=bind_live_candidate_sequence(
+                    [make_window(value) for value in pcm_values]
+                ),
             ),
             mock.patch(
                 "src.web.app.has_detectable_speech_pcm16",
@@ -6908,25 +7370,24 @@ class SmokeTests(unittest.TestCase):
 
     def test_live_candidate_fixed_capture_failure_has_zero_private_residue(self) -> None:
         """A fixed child failure should be class-only with zero turn counts."""
-        app = create_app()
-        app.config[ENABLE_PROCESS_SHUTDOWN_CONFIG] = False
-        client = app.test_client()
-        headers = {"X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]}
+        gate = prepare_current_input_gate()
+        observed_epochs: list[object] = []
+
+        def fail_capture(**kwargs: object) -> object:
+            observed_epochs.append(kwargs["source_epoch_binding"])
+            raise AudioEnvironmentError("voice_capture_dsp_start_failed")
+
         with mock.patch(
             "src.web.app.capture_live_microphone_candidate_window",
-            side_effect=AudioEnvironmentError("voice_capture_dsp_start_failed"),
+            side_effect=fail_capture,
         ):
-            response = client.post(
-                "/api/live-input-gate/candidate-window",
-                headers=headers,
-                json={
-                    "scenario": "self_output_or_ambiguous",
-                    "window_ms": 100,
-                    "deadline_ms": 1000,
-                },
+            payload = execute_live_candidate_window(
+                input_gate=gate,
+                scenario="self_output_or_ambiguous",
+                window_ms=100,
+                deadline_ms=1000,
+                private_turn_sink=None,
             )
-        self.assertEqual(response.status_code, 503)
-        payload = response.get_json()
         self.assertEqual(payload["result_class"], "voice_capture_dsp_start_failed")
         self.assertEqual(payload["transcription_count"], 0)
         self.assertEqual(payload["submission_count"], 0)
@@ -6935,6 +7396,10 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(payload["vad_decision_class"], "not_evaluated")
         self.assertEqual(payload["pcm_cleanup_count"], 0)
         self.assertEqual(payload["private_authority_residue_count"], 0)
+        self.assertEqual(len(observed_epochs), 1)
+        self.assertIsNone(
+            gate.live_input_source_epoch_processing_mode(observed_epochs[0])
+        )
 
     def test_live_candidate_sink_absent_or_failed_submits_zero(self) -> None:
         """A missing or failed private sink must not claim a Thought Core turn."""
@@ -6983,11 +7448,18 @@ class SmokeTests(unittest.TestCase):
                 with (
                     mock.patch(
                         "src.web.app.capture_live_microphone_candidate_window",
-                        return_value=capture_window,
+                        side_effect=lambda **kwargs: bind_live_candidate_window(
+                            capture_window,
+                            kwargs["source_epoch_binding"],
+                        ),
                     ),
                     mock.patch(
                         "src.web.app.has_detectable_speech_pcm16",
                         return_value=True,
+                    ),
+                    mock.patch(
+                        "src.web.app.find_last_vad_speech_frame_offset_ms",
+                        return_value=90,
                     ),
                     mock.patch(
                         "src.web.app.get_cached_transcription_pipeline",
@@ -7037,6 +7509,12 @@ class SmokeTests(unittest.TestCase):
             )
         self.assertEqual(unauthenticated.status_code, 403)
         capture.assert_not_called()
+
+        lifecycle_client = app.test_client()
+        lifecycle_headers = {
+            "X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]
+        }
+        post_current_lifecycle_events(lifecycle_client, lifecycle_headers)
 
         entered = threading.Event()
         release = threading.Event()
