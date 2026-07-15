@@ -140,6 +140,7 @@ from src.web.app import (
     WEB_MAX_RECORDING_CHUNKS,
     RuntimeStatusWriter,
     _validate_live_candidate_sink_result,
+    classify_canonical_accept_latency,
     build_runtime_status_payload,
     build_input_gate_response,
     create_app,
@@ -5441,6 +5442,222 @@ class SmokeTests(unittest.TestCase):
             LIVE_CAPTURE_MODE_NS_AGC,
         )
 
+    def test_overlap_source_epoch_is_private_and_gate_owned(self) -> None:
+        """Only the exact gate epoch may qualify active near-end speech."""
+        gate = InputGate()
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("handoff_accepted"),
+        )
+        gate.observe_self_output_observation(build_self_output_observation())
+        epoch = gate.begin_live_input_source_epoch(
+            capture_started_monotonic=100.0,
+            deadline_ms=1000,
+        )
+        self.assertIsNotNone(epoch)
+        self.assertEqual(repr(epoch), "<input-source-epoch private>")
+        with self.assertRaises(TypeError):
+            bool(epoch)
+        with self.assertRaises(TypeError):
+            copy.copy(epoch)
+        with self.assertRaises(TypeError):
+            pickle.dumps(epoch)
+        self.assertEqual(
+            gate.live_input_source_epoch_processing_mode(epoch),
+            LIVE_CAPTURE_MODE_AEC,
+        )
+        self.assertIsNone(
+            gate.live_input_source_epoch_processing_mode(object())
+        )
+        candidate = gate.evaluate_live_processed_candidate(
+            has_speech=True,
+            window_ms=100,
+            packet_count=1,
+            processed_byte_count=320,
+            frame_bytes=320,
+            source_epoch=epoch,
+            speech_end_monotonic=100.05,
+        )
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.cooldown_status, "overlap_current_lease")
+        capability = gate.issue_turn_input_capability(candidate)
+        self.assertIsNotNone(capability)
+        self.assertTrue(
+            gate.consume_turn_input_capability(capability, candidate)
+        )
+        self.assertIsNotNone(gate.build_consumed_candidate_audit(candidate))
+        self.assertEqual(gate.private_authority_residue_count(), 0)
+
+    def test_overlap_epoch_release_stale_generation_and_disabled_fail_closed(self) -> None:
+        """Release ordering and epoch identity reject stale callbacks."""
+        gate = InputGate()
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("handoff_accepted"),
+        )
+        gate.observe_self_output_observation(build_self_output_observation())
+        epoch = gate.begin_live_input_source_epoch(
+            capture_started_monotonic=100.0,
+            deadline_ms=1000,
+        )
+        self.assertIsNotNone(epoch)
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("cooldown"),
+            wall_timestamp="2026-07-13T12:00:01.000Z",
+        )
+        with mock.patch("src.core.input_gate.time.monotonic", return_value=100.02):
+            observe_gate_lifecycle(
+                gate,
+                build_system_speech_lifecycle("released"),
+                wall_timestamp="2026-07-13T12:00:02.000Z",
+            )
+        rejected = gate.evaluate_live_processed_candidate(
+            has_speech=True,
+            window_ms=100,
+            packet_count=1,
+            processed_byte_count=320,
+            frame_bytes=320,
+            source_epoch=epoch,
+            speech_end_monotonic=100.05,
+        )
+        self.assertIsNone(rejected)
+        self.assertIsNone(
+            gate.evaluate_live_processed_candidate(
+                has_speech=True,
+                window_ms=100,
+                packet_count=1,
+                processed_byte_count=320,
+                frame_bytes=320,
+                source_epoch=object(),
+                speech_end_monotonic=100.01,
+            )
+        )
+
+        current = prepare_current_input_gate()
+        current_epoch = current.begin_live_input_source_epoch(
+            capture_started_monotonic=200.0,
+            deadline_ms=1000,
+        )
+        self.assertIsNotNone(current_epoch)
+        current.set_input_enabled(False)
+        self.assertIsNone(
+            current.evaluate_live_processed_candidate(
+                has_speech=True,
+                window_ms=100,
+                packet_count=1,
+                processed_byte_count=320,
+                frame_bytes=320,
+                source_epoch=current_epoch,
+                speech_end_monotonic=200.05,
+            )
+        )
+
+    def test_overlap_epoch_allows_speech_that_ended_before_same_lease_release(self) -> None:
+        """A later same-lease release does not erase a completed overlap."""
+        gate = InputGate()
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("handoff_accepted"),
+        )
+        gate.observe_self_output_observation(build_self_output_observation())
+        epoch = gate.begin_live_input_source_epoch(
+            capture_started_monotonic=100.0,
+            deadline_ms=5000,
+        )
+        self.assertIsNotNone(epoch)
+        with mock.patch("src.core.input_gate.time.monotonic", return_value=101.5):
+            observe_gate_lifecycle(
+                gate,
+                build_system_speech_lifecycle("cooldown"),
+                wall_timestamp="2026-07-13T12:00:01.000Z",
+            )
+        with mock.patch("src.core.input_gate.time.monotonic", return_value=102.0):
+            observe_gate_lifecycle(
+                gate,
+                build_system_speech_lifecycle("released"),
+                wall_timestamp="2026-07-13T12:00:02.000Z",
+            )
+        candidate = gate.evaluate_live_processed_candidate(
+            has_speech=True,
+            window_ms=100,
+            packet_count=1,
+            processed_byte_count=320,
+            frame_bytes=320,
+            source_epoch=epoch,
+            speech_end_monotonic=101.0,
+        )
+        self.assertIsNotNone(candidate)
+        capability = gate.issue_turn_input_capability(candidate)
+        self.assertIsNotNone(capability)
+        self.assertTrue(
+            gate.consume_turn_input_capability(capability, candidate)
+        )
+
+    def test_old_source_epoch_cannot_cross_into_next_matched_generation(self) -> None:
+        """A matching N+1 join must still reject the exact N source epoch."""
+        gate = InputGate()
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle("handoff_accepted"),
+        )
+        gate.observe_self_output_observation(build_self_output_observation())
+        old_epoch = gate.begin_live_input_source_epoch(
+            capture_started_monotonic=100.0,
+            deadline_ms=1000,
+        )
+        self.assertIsNotNone(old_epoch)
+
+        next_session_id = "system-speech-session:sss_cccccccccccccccccccccccccccccccc"
+        next_playback_ref = "playback-event:pe_dddddddddddddddddddddddddddddddd"
+        observe_gate_lifecycle(
+            gate,
+            build_system_speech_lifecycle(
+                "handoff_accepted",
+                generation=8,
+                session_id=next_session_id,
+                playback_ref=next_playback_ref,
+            ),
+            turn_id="web_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            wall_timestamp="2026-07-13T12:01:00.000Z",
+        )
+        gate.observe_self_output_observation(
+            build_self_output_observation(
+                generation=8,
+                session_id=next_session_id,
+                playback_ref=next_playback_ref,
+            )
+        )
+        self.assertIsNone(
+            gate.evaluate_live_processed_candidate(
+                has_speech=True,
+                window_ms=100,
+                packet_count=1,
+                processed_byte_count=320,
+                frame_bytes=320,
+                source_epoch=old_epoch,
+                speech_end_monotonic=100.05,
+            )
+        )
+
+        current_epoch = gate.begin_live_input_source_epoch(
+            capture_started_monotonic=200.0,
+            deadline_ms=1000,
+        )
+        self.assertIsNotNone(current_epoch)
+        current_candidate = gate.evaluate_live_processed_candidate(
+            has_speech=True,
+            window_ms=100,
+            packet_count=1,
+            processed_byte_count=320,
+            frame_bytes=320,
+            source_epoch=current_epoch,
+            speech_end_monotonic=200.05,
+        )
+        self.assertIsNotNone(current_candidate)
+        self.assertTrue(gate.discard_candidate(current_candidate))
+        self.assertEqual(gate.private_authority_residue_count(), 0)
+
     def test_lower_generation_restart_requires_new_ordered_transport_join(
         self,
     ) -> None:
@@ -5871,6 +6088,22 @@ class SmokeTests(unittest.TestCase):
             payload["utterance_end_timing_class"],
             "vad_speech_frame_available",
         )
+        self.assertLessEqual(
+            payload["stt_start_offset_ms"],
+            payload["stt_end_offset_ms"],
+        )
+        self.assertLessEqual(
+            payload["stt_end_offset_ms"],
+            payload["canonical_accept_offset_ms"],
+        )
+        self.assertEqual(
+            payload["canonical_accept_latency_class"],
+            "within_2s_target",
+        )
+        self.assertEqual(
+            payload["inflight_sink_cancellation_class"],
+            "not_required_within_10s",
+        )
         self.assertEqual(
             set(payload),
             {
@@ -5888,6 +6121,11 @@ class SmokeTests(unittest.TestCase):
                 "last_vad_speech_frame_offset_ms",
                 "utterance_end_to_candidate_result_ms",
                 "utterance_end_timing_class",
+                "stt_start_offset_ms",
+                "stt_end_offset_ms",
+                "canonical_accept_offset_ms",
+                "canonical_accept_latency_class",
+                "inflight_sink_cancellation_class",
                 "presentation_class",
                 "assistant_event_id",
                 "thought_core_first_event_elapsed_ms",
@@ -5920,6 +6158,166 @@ class SmokeTests(unittest.TestCase):
         self.assertNotIn(SYSTEM_SPEECH_SESSION_ID, serialized_response)
         self.assertNotIn(PLAYBACK_EVENT_REF, serialized_response)
         self.assertNotIn("candidate_id", serialized_response)
+
+    def test_live_candidate_latency_classes_and_post_stt_suppression(self) -> None:
+        """Late STT is classified and cannot start a new sink request."""
+        self.assertEqual(classify_canonical_accept_latency(2000), "within_2s_target")
+        self.assertEqual(
+            classify_canonical_accept_latency(2001),
+            "over_2s_within_10s",
+        )
+        self.assertEqual(
+            classify_canonical_accept_latency(10_000),
+            "over_2s_within_10s",
+        )
+        self.assertEqual(classify_canonical_accept_latency(10_001), "over_10s")
+        self.assertEqual(classify_canonical_accept_latency(None), "not_evaluated")
+
+        sink = mock.Mock()
+        app = create_app(private_turn_sink=sink)
+        app.config[ENABLE_PROCESS_SHUTDOWN_CONFIG] = False
+        client = app.test_client()
+        headers = {"X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]}
+        post_current_lifecycle_events(client, headers)
+        pcm = bytearray(b"\x21\x00" * 160)
+        capture_window = LiveMicrophoneCandidateWindow(
+            chunk=AudioChunk(
+                path=None,
+                source="microphone",
+                pcm16=pcm,
+                sample_rate=16_000,
+                storage_class="in_memory_ephemeral",
+                turn_input_authority=False,
+                turn_input_authority_class="processed_near_end_observation_only",
+            ),
+            packet_count=1,
+            window_ms=100,
+        )
+        pipeline = mock.Mock()
+        pipeline._transcribe_private_buffer_result.return_value = TranscriptionResult(
+            source="microphone",
+            text="private-late-stt-text",
+            is_final=False,
+            chunk_count=1,
+        )
+        with (
+            mock.patch(
+                "src.web.app.capture_live_microphone_candidate_window",
+                return_value=capture_window,
+            ),
+            mock.patch(
+                "src.web.app.has_detectable_speech_pcm16",
+                return_value=True,
+            ),
+            mock.patch(
+                "src.web.app.find_last_vad_speech_frame_offset_ms",
+                return_value=40,
+            ),
+            mock.patch(
+                "src.web.app.get_cached_transcription_pipeline",
+                return_value=pipeline,
+            ),
+            mock.patch(
+                "src.web.app.time.monotonic",
+                side_effect=(100.0, 100.05, 100.2, 110.1, 110.2),
+            ),
+        ):
+            response = client.post(
+                "/api/live-input-gate/candidate-window",
+                headers=headers,
+                json={
+                    "scenario": "independent_current_session_user_speech",
+                    "window_ms": 100,
+                    "deadline_ms": 1000,
+                },
+            )
+        self.assertEqual(response.status_code, 503)
+        payload = response.get_json()
+        self.assertEqual(payload["result_class"], "voice_response_latency_over_10s")
+        self.assertEqual(payload["transcription_count"], 1)
+        self.assertEqual(payload["submission_count"], 0)
+        self.assertEqual(payload["thought_core_turninput_count"], 0)
+        self.assertEqual(payload["canonical_accept_offset_ms"], None)
+        self.assertEqual(payload["canonical_accept_latency_class"], "over_10s")
+        self.assertEqual(
+            payload["inflight_sink_cancellation_class"],
+            "pre_sink_over_10s_suppressed",
+        )
+        sink.assert_not_called()
+        self.assertEqual(pcm, bytearray(len(pcm)))
+
+    def test_live_candidate_route_deadline_blocks_sink_after_stt(self) -> None:
+        """A sub-10-second STT result after the request deadline cannot submit."""
+        sink = mock.Mock()
+        app = create_app(private_turn_sink=sink)
+        app.config[ENABLE_PROCESS_SHUTDOWN_CONFIG] = False
+        client = app.test_client()
+        headers = {"X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]}
+        post_current_lifecycle_events(client, headers)
+        pcm = bytearray(b"\x21\x00" * 160)
+        capture_window = LiveMicrophoneCandidateWindow(
+            chunk=AudioChunk(
+                path=None,
+                source="microphone",
+                pcm16=pcm,
+                sample_rate=16_000,
+                storage_class="in_memory_ephemeral",
+                turn_input_authority=False,
+                turn_input_authority_class="processed_near_end_observation_only",
+            ),
+            packet_count=1,
+            window_ms=100,
+        )
+        pipeline = mock.Mock()
+        pipeline._transcribe_private_buffer_result.return_value = TranscriptionResult(
+            source="microphone",
+            text="private-after-deadline-stt",
+            is_final=False,
+            chunk_count=1,
+        )
+        with (
+            mock.patch(
+                "src.web.app.capture_live_microphone_candidate_window",
+                return_value=capture_window,
+            ),
+            mock.patch(
+                "src.web.app.has_detectable_speech_pcm16",
+                return_value=True,
+            ),
+            mock.patch(
+                "src.web.app.find_last_vad_speech_frame_offset_ms",
+                return_value=40,
+            ),
+            mock.patch(
+                "src.web.app.get_cached_transcription_pipeline",
+                return_value=pipeline,
+            ),
+            mock.patch(
+                "src.web.app.time.monotonic",
+                side_effect=(200.0, 200.05, 200.2, 201.2, 201.3),
+            ),
+        ):
+            response = client.post(
+                "/api/live-input-gate/candidate-window",
+                headers=headers,
+                json={
+                    "scenario": "independent_current_session_user_speech",
+                    "window_ms": 100,
+                    "deadline_ms": 1000,
+                },
+            )
+        self.assertEqual(response.status_code, 503)
+        payload = response.get_json()
+        self.assertEqual(payload["result_class"], "live_candidate_window_failed")
+        self.assertEqual(payload["transcription_count"], 1)
+        self.assertEqual(payload["submission_count"], 0)
+        self.assertEqual(payload["thought_core_turninput_count"], 0)
+        self.assertIsNotNone(payload["stt_end_offset_ms"])
+        self.assertLess(payload["stt_end_offset_ms"], 10_000)
+        self.assertEqual(payload["private_authority_residue_count"], 0)
+        self.assertEqual(payload["pcm_cleanup_count"], 1)
+        sink.assert_not_called()
+        self.assertEqual(pcm, bytearray(len(pcm)))
 
     def test_live_candidate_sink_result_contract_rejects_extras_private_ids_and_cross_field_mismatch(
         self,
@@ -6004,6 +6402,10 @@ class SmokeTests(unittest.TestCase):
                         "src.web.app.has_detectable_speech_pcm16",
                         return_value=actual_speech,
                     ),
+                    mock.patch(
+                        "src.web.app.find_last_vad_speech_frame_offset_ms",
+                        return_value=40 if actual_speech else None,
+                    ),
                 ):
                     response = client.post(
                         "/api/live-input-gate/candidate-window",
@@ -6014,7 +6416,7 @@ class SmokeTests(unittest.TestCase):
                             "deadline_ms": 1000,
                         },
                     )
-                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.status_code, 200, response.get_json())
                 payload = response.get_json()
                 self.assertEqual(
                     payload["result_class"],
@@ -6034,6 +6436,108 @@ class SmokeTests(unittest.TestCase):
                 self.assertEqual(pcm, bytearray(len(pcm)))
                 self.assertEqual(payload["private_authority_residue_count"], 0)
                 sink.assert_not_called()
+
+    def test_expectation_mismatch_retires_epoch_before_next_window(self) -> None:
+        """An unissued mismatch candidate cannot retain or poison gate authority."""
+        sink = mock.Mock(
+            return_value={
+                "result_class": "thought_core_turninput_accepted",
+                "submission_count": 1,
+                "thought_core_turninput_count": 1,
+                "presentation_class": "aituber_presentation_not_forwarded",
+                "assistant_event_id": None,
+                "thought_core_first_event_elapsed_ms": None,
+                "raw_private_publication_flags": False,
+            }
+        )
+        app = create_app(private_turn_sink=sink)
+        app.config[ENABLE_PROCESS_SHUTDOWN_CONFIG] = False
+        client = app.test_client()
+        headers = {"X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]}
+        post_current_lifecycle_events(client, headers)
+        pcm_values = [bytearray(b"\x21\x00" * 160) for _ in range(2)]
+
+        def make_window(pcm: bytearray) -> LiveMicrophoneCandidateWindow:
+            return LiveMicrophoneCandidateWindow(
+                chunk=AudioChunk(
+                    path=None,
+                    source="microphone",
+                    pcm16=pcm,
+                    sample_rate=16_000,
+                    storage_class="in_memory_ephemeral",
+                    turn_input_authority=False,
+                    turn_input_authority_class=(
+                        "processed_near_end_observation_only"
+                    ),
+                ),
+                packet_count=1,
+                window_ms=100,
+            )
+
+        pipeline = mock.Mock()
+        pipeline._transcribe_private_buffer_result.return_value = (
+            TranscriptionResult(
+                source="microphone",
+                text="private-recovered-window",
+                is_final=False,
+                chunk_count=1,
+            )
+        )
+        with (
+            mock.patch(
+                "src.web.app.capture_live_microphone_candidate_window",
+                side_effect=[make_window(value) for value in pcm_values],
+            ),
+            mock.patch(
+                "src.web.app.has_detectable_speech_pcm16",
+                return_value=True,
+            ),
+            mock.patch(
+                "src.web.app.find_last_vad_speech_frame_offset_ms",
+                return_value=40,
+            ),
+            mock.patch(
+                "src.web.app.get_cached_transcription_pipeline",
+                return_value=pipeline,
+            ),
+        ):
+            mismatch = client.post(
+                "/api/live-input-gate/candidate-window",
+                headers=headers,
+                json={
+                    "scenario": "self_output_or_ambiguous",
+                    "window_ms": 100,
+                    "deadline_ms": 1000,
+                },
+            )
+            recovered = client.post(
+                "/api/live-input-gate/candidate-window",
+                headers=headers,
+                json={
+                    "scenario": "independent_current_session_user_speech",
+                    "window_ms": 100,
+                    "deadline_ms": 1000,
+                },
+            )
+
+        self.assertEqual(mismatch.status_code, 200)
+        self.assertEqual(
+            mismatch.get_json()["result_class"],
+            "scenario_expectation_not_met",
+        )
+        self.assertEqual(mismatch.get_json()["private_authority_residue_count"], 0)
+        self.assertEqual(mismatch.get_json()["submission_count"], 0)
+        self.assertEqual(recovered.status_code, 200)
+        self.assertEqual(
+            recovered.get_json()["result_class"],
+            "independent_user_speech_turninput_accepted",
+        )
+        self.assertEqual(recovered.get_json()["thought_core_turninput_count"], 1)
+        self.assertEqual(recovered.get_json()["private_authority_residue_count"], 0)
+        sink.assert_called_once()
+        self.assertTrue(
+            all(pcm == bytearray(len(pcm)) for pcm in pcm_values)
+        )
 
     def test_live_candidate_request_rejects_authority_fields_before_capture(self) -> None:
         """Caller classification and authority values should fail before capture."""
@@ -6275,4 +6779,3 @@ class SmokeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-    has_detectable_speech_pcm16,

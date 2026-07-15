@@ -8,6 +8,7 @@ import math
 import re
 import secrets
 import threading
+import time
 from typing import Any, Mapping
 
 
@@ -135,6 +136,59 @@ class _SelfOutputObservation:
     playback_event_ref: str
 
 
+class _InputSourceEpoch:
+    """Private lease proving which gate-owned input window produced a callback."""
+
+    __slots__ = (
+        "_owner",
+        "_identity",
+        "_lifecycle",
+        "_self_output",
+        "_lifecycle_state_at_capture",
+        "_capture_started_monotonic",
+        "_deadline_monotonic",
+    )
+
+    def __init__(
+        self,
+        *,
+        owner: object,
+        lifecycle: _SystemSpeechLifecycleObservation,
+        self_output: _SelfOutputObservation,
+        capture_started_monotonic: float,
+        deadline_monotonic: float,
+    ) -> None:
+        self._owner = owner
+        self._identity = object()
+        self._lifecycle = lifecycle
+        self._self_output = self_output
+        self._lifecycle_state_at_capture = lifecycle.lifecycle_state
+        self._capture_started_monotonic = capture_started_monotonic
+        self._deadline_monotonic = deadline_monotonic
+
+    def __repr__(self) -> str:
+        return "<input-source-epoch private>"
+
+    __str__ = __repr__
+
+    def __bool__(self) -> bool:
+        raise TypeError("input source epoch has no boolean representation")
+
+    def __copy__(self) -> object:
+        raise TypeError("input source epoch cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> object:
+        del memo
+        raise TypeError("input source epoch cannot be copied")
+
+    def __reduce__(self) -> object:
+        raise TypeError("input source epoch cannot be serialized")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("input source epoch cannot be serialized")
+
+
 @dataclass(slots=True)
 class _PendingTurnInputCapability:
     capability: _TurnInputCapability
@@ -143,6 +197,7 @@ class _PendingTurnInputCapability:
     candidate_identity: object
     lifecycle: _SystemSpeechLifecycleObservation
     self_output: _SelfOutputObservation
+    source_epoch: _InputSourceEpoch | None
 
 
 class _TurnInputCapability:
@@ -277,12 +332,15 @@ class InputGate:
         )
         self._lock = threading.RLock()
         self._capability_owner = object()
+        self._source_epoch_owner = object()
         self._capability_generation = 0
         self._lifecycle: _SystemSpeechLifecycleObservation | None = None
+        self._lifecycle_observed_monotonic: float | None = None
         self._lifecycle_transport: _LifecycleTransportContext | None = None
         self._self_output: _SelfOutputObservation | None = None
         self._seen_lifecycle_leases: set[tuple[str, int, str]] = set()
         self._pending: dict[int, _PendingTurnInputCapability] = {}
+        self._candidate_source_epochs: dict[int, _InputSourceEpoch] = {}
         self._used_candidate_ids: set[str] = set()
         self._consumed_candidates: dict[str, UserSpeechCandidateEvidence] = {}
 
@@ -404,6 +462,7 @@ class InputGate:
                     raise InputGateError("system speech lifecycle history is full")
                 self._seen_lifecycle_leases.add(lease_key)
             self._lifecycle = observation
+            self._lifecycle_observed_monotonic = time.monotonic()
             self._lifecycle_transport = transport
 
     def _invalidate_join_for_system_speech_locked(self) -> None:
@@ -412,6 +471,7 @@ class InputGate:
         for pending in self._pending.values():
             self._used_candidate_ids.add(pending.candidate.candidate_id)
         self._pending.clear()
+        self._candidate_source_epochs.clear()
         self._consumed_candidates.clear()
 
     def observe_self_output_observation(self, payload: Mapping[str, Any]) -> None:
@@ -436,13 +496,12 @@ class InputGate:
         with self._lock:
             lifecycle = self._lifecycle
             self_output = self._self_output
+            source_epoch = self._candidate_source_epochs.get(id(candidate))
             if (
                 lifecycle is None
                 or self_output is None
-                or not _candidate_matches_current_join(
-                    candidate,
-                    lifecycle,
-                    self_output,
+                or not self._candidate_matches_current_join_locked(
+                    candidate, lifecycle, self_output, source_epoch
                 )
                 or candidate.candidate_id in self._used_candidate_ids
                 or bool(self._pending)
@@ -463,6 +522,7 @@ class InputGate:
                 candidate_identity=candidate_identity,
                 lifecycle=lifecycle,
                 self_output=self_output,
+                source_epoch=source_epoch,
             )
             return capability
 
@@ -491,19 +551,20 @@ class InputGate:
             self._used_candidate_ids.add(candidate.candidate_id)
             lifecycle = self._lifecycle
             self_output = self._self_output
+            source_epoch = self._candidate_source_epochs.get(id(candidate))
             accepted = bool(
                 lifecycle is not None
                 and self_output is not None
                 and lifecycle == pending.lifecycle
                 and self_output == pending.self_output
-                and _candidate_matches_current_join(
-                    candidate,
-                    lifecycle,
-                    self_output,
+                and source_epoch is pending.source_epoch
+                and self._candidate_matches_current_join_locked(
+                    candidate, lifecycle, self_output, source_epoch
                 )
             )
             if accepted:
                 self._consumed_candidates[candidate.candidate_id] = candidate
+            self._candidate_source_epochs.pop(id(candidate), None)
             return accepted
 
     def cancel_turn_input_capability(
@@ -529,6 +590,7 @@ class InputGate:
                 return False
             del self._pending[id(capability)]
             self._used_candidate_ids.add(candidate.candidate_id)
+            self._candidate_source_epochs.pop(id(candidate), None)
             return True
 
     def discard_consumed_candidate(self, candidate: object) -> bool:
@@ -539,12 +601,32 @@ class InputGate:
             if self._consumed_candidates.get(candidate.candidate_id) is not candidate:
                 return False
             del self._consumed_candidates[candidate.candidate_id]
+            self._candidate_source_epochs.pop(id(candidate), None)
+            return True
+
+    def discard_candidate(self, candidate: object) -> bool:
+        """Retire exact unissued private candidate evidence and its source epoch."""
+        if type(candidate) is not UserSpeechCandidateEvidence:
+            return False
+        with self._lock:
+            if any(pending.candidate is candidate for pending in self._pending.values()):
+                return False
+            if self._consumed_candidates.get(candidate.candidate_id) is candidate:
+                return False
+            source_epoch = self._candidate_source_epochs.pop(id(candidate), None)
+            if source_epoch is None:
+                return False
+            self._used_candidate_ids.add(candidate.candidate_id)
             return True
 
     def private_authority_residue_count(self) -> int:
         """Return a class-only count of pending or retained private authority."""
         with self._lock:
-            return len(self._pending) + len(self._consumed_candidates)
+            return (
+                len(self._pending)
+                + len(self._consumed_candidates)
+                + len(self._candidate_source_epochs)
+            )
 
     def body_state_projection(self) -> dict[str, bool | str]:
         """Return the fixed, textless current hearing-organ state projection."""
@@ -609,6 +691,61 @@ class InputGate:
                 return LIVE_CAPTURE_MODE_NS_AGC
             return LIVE_CAPTURE_MODE_AEC
 
+    def begin_live_input_source_epoch(
+        self,
+        *,
+        capture_started_monotonic: float,
+        deadline_ms: int,
+    ) -> object | None:
+        """Mint one private source epoch from the current gate-owned causal join."""
+        if (
+            isinstance(capture_started_monotonic, bool)
+            or not isinstance(capture_started_monotonic, (int, float))
+            or not math.isfinite(float(capture_started_monotonic))
+            or isinstance(deadline_ms, bool)
+            or not isinstance(deadline_ms, int)
+            or not 300 <= deadline_ms <= 10_000
+        ):
+            return None
+        started = float(capture_started_monotonic)
+        with self._lock:
+            lifecycle = self._lifecycle
+            self_output = self._self_output
+            if (
+                not self._state.enabled
+                or lifecycle is None
+                or self_output is None
+                or lifecycle.lifecycle_state
+                not in {"handoff_accepted", "cooldown", "released"}
+                or not _same_observation_context(lifecycle, self_output)
+                or bool(self._pending)
+                or len(self._used_candidate_ids) >= 4096
+            ):
+                return None
+            return _InputSourceEpoch(
+                owner=self._source_epoch_owner,
+                lifecycle=lifecycle,
+                self_output=self_output,
+                capture_started_monotonic=started,
+                deadline_monotonic=started + (deadline_ms / 1000),
+            )
+
+    def live_input_source_epoch_processing_mode(
+        self,
+        source_epoch: object,
+    ) -> str | None:
+        """Return the processing mode only for the exact current private epoch."""
+        if type(source_epoch) is not _InputSourceEpoch:
+            return None
+        with self._lock:
+            if not self._source_epoch_is_current_locked(source_epoch):
+                return None
+            return (
+                LIVE_CAPTURE_MODE_NS_AGC
+                if source_epoch._lifecycle_state_at_capture == "released"
+                else LIVE_CAPTURE_MODE_AEC
+            )
+
     def evaluate_live_processed_candidate(
         self,
         *,
@@ -617,6 +754,8 @@ class InputGate:
         packet_count: int,
         processed_byte_count: int,
         frame_bytes: int,
+        source_epoch: object | None = None,
+        speech_end_monotonic: float | None = None,
     ) -> UserSpeechCandidateEvidence | None:
         """Create private candidate evidence from gate-owned current state.
 
@@ -625,19 +764,41 @@ class InputGate:
         """
         if not isinstance(has_speech, bool) or not has_speech:
             return None
+        if source_epoch is not None and type(source_epoch) is not _InputSourceEpoch:
+            return None
         with self._lock:
             lifecycle = self._lifecycle
             self_output = self._self_output
+            epoch = source_epoch if type(source_epoch) is _InputSourceEpoch else None
+            using_epoch = epoch is not None
             if (
                 not self._state.enabled
                 or lifecycle is None
                 or self_output is None
-                or lifecycle.lifecycle_state != "released"
                 or not _same_observation_context(lifecycle, self_output)
                 or bool(self._pending)
                 or len(self._used_candidate_ids) >= 4096
             ):
                 return None
+            if using_epoch:
+                if (
+                    isinstance(speech_end_monotonic, bool)
+                    or not isinstance(speech_end_monotonic, (int, float))
+                    or not math.isfinite(float(speech_end_monotonic))
+                    or not self._source_epoch_allows_speech_end_locked(
+                        epoch,
+                        float(speech_end_monotonic),
+                    )
+                ):
+                    return None
+                overlap = epoch._lifecycle_state_at_capture in {
+                    "handoff_accepted",
+                    "cooldown",
+                }
+            else:
+                if lifecycle.lifecycle_state != "released":
+                    return None
+                overlap = False
             candidate = UserSpeechCandidateEvidence(
                 candidate_id=f"ausc_live:cid_{secrets.token_hex(16)}",
                 source_kind="user_speech_candidate",
@@ -667,21 +828,86 @@ class InputGate:
                 post_compare_session_status="current_unchanged",
                 self_output_correlation_class="not_self_output",
                 active_session_exclusion_status=(
-                    "explicitly_excluded_from_candidate"
+                    "near_end_speech_distinguished_from_active_self_output"
+                    if overlap
+                    else "explicitly_excluded_from_candidate"
                 ),
-                cooldown_status="clear",
+                cooldown_status=(
+                    "overlap_current_lease" if overlap else "clear"
+                ),
                 opaque_refs_non_dereferenceable=True,
                 decision_owner="ai_talk_core_input_gate",
                 acceptance_status="accepted_user_speech_candidate",
                 may_materialize_thought_core_turninput=True,
             )
-            if not _candidate_matches_current_join(
-                candidate,
-                lifecycle,
-                self_output,
+            if using_epoch:
+                self._candidate_source_epochs[id(candidate)] = epoch
+            if not self._candidate_matches_current_join_locked(
+                candidate, lifecycle, self_output, epoch
             ):
+                self._candidate_source_epochs.pop(id(candidate), None)
                 return None
             return candidate
+
+    def _source_epoch_is_current_locked(self, epoch: _InputSourceEpoch) -> bool:
+        lifecycle = self._lifecycle
+        self_output = self._self_output
+        return bool(
+            epoch._owner is self._source_epoch_owner
+            and lifecycle is not None
+            and self_output is not None
+            and _lifecycle_lease_key(lifecycle)
+            == _lifecycle_lease_key(epoch._lifecycle)
+            and _same_observation_context(lifecycle, self_output)
+            and self_output == epoch._self_output
+        )
+
+    def _source_epoch_allows_speech_end_locked(
+        self,
+        epoch: _InputSourceEpoch,
+        speech_end_monotonic: float,
+    ) -> bool:
+        if (
+            not self._state.enabled
+            or not self._source_epoch_is_current_locked(epoch)
+            or speech_end_monotonic < epoch._capture_started_monotonic
+            or speech_end_monotonic > epoch._deadline_monotonic
+        ):
+            return False
+        lifecycle = self._lifecycle
+        if lifecycle is None:
+            return False
+        if epoch._lifecycle_state_at_capture == "released":
+            return lifecycle.lifecycle_state == "released"
+        if lifecycle.lifecycle_state in {"handoff_accepted", "cooldown"}:
+            return True
+        return bool(
+            lifecycle.lifecycle_state == "released"
+            and self._lifecycle_observed_monotonic is not None
+            and speech_end_monotonic <= self._lifecycle_observed_monotonic
+        )
+
+    def _candidate_matches_current_join_locked(
+        self,
+        candidate: UserSpeechCandidateEvidence,
+        lifecycle: _SystemSpeechLifecycleObservation,
+        self_output: _SelfOutputObservation,
+        source_epoch: _InputSourceEpoch | None,
+    ) -> bool:
+        overlap = candidate.cooldown_status == "overlap_current_lease"
+        if overlap:
+            if (
+                source_epoch is None
+                or self._candidate_source_epochs.get(id(candidate)) is not source_epoch
+                or not self._source_epoch_is_current_locked(source_epoch)
+            ):
+                return False
+        return _candidate_matches_current_join(
+            candidate,
+            lifecycle,
+            self_output,
+            allow_overlap=overlap,
+        )
 
     def build_consumed_candidate_audit(
         self,
@@ -1091,8 +1317,16 @@ def _candidate_matches_current_join(
     candidate: UserSpeechCandidateEvidence,
     lifecycle: _SystemSpeechLifecycleObservation,
     self_output: _SelfOutputObservation,
+    *,
+    allow_overlap: bool = False,
 ) -> bool:
-    if lifecycle.lifecycle_state != "released":
+    if (
+        lifecycle.lifecycle_state != "released"
+        and not (
+            allow_overlap
+            and lifecycle.lifecycle_state in {"handoff_accepted", "cooldown"}
+        )
+    ):
         return False
     if not _same_observation_context(lifecycle, self_output):
         return False
@@ -1129,13 +1363,25 @@ def _candidate_matches_current_join(
         != "audio_self_output_observation.v0"
     ):
         return False
+    overlap_fields_match = (
+        candidate.active_session_exclusion_status
+        == "near_end_speech_distinguished_from_active_self_output"
+        and candidate.cooldown_status == "overlap_current_lease"
+    )
+    independent_fields_match = (
+        candidate.active_session_exclusion_status
+        == "explicitly_excluded_from_candidate"
+        and candidate.cooldown_status == "clear"
+    )
     return (
         candidate.session_join_status == "current_match"
         and candidate.post_compare_session_status == "current_unchanged"
         and candidate.self_output_correlation_class == "not_self_output"
-        and candidate.active_session_exclusion_status
-        == "explicitly_excluded_from_candidate"
-        and candidate.cooldown_status == "clear"
+        and (
+            overlap_fields_match
+            if allow_overlap
+            else independent_fields_match
+        )
         and candidate.opaque_refs_non_dereferenceable is True
         and candidate.decision_owner == "ai_talk_core_input_gate"
         and candidate.acceptance_status == "accepted_user_speech_candidate"

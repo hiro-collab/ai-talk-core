@@ -719,6 +719,11 @@ def build_live_candidate_window_response(
     last_vad_speech_frame_offset_ms: int | None = None,
     utterance_end_to_candidate_result_ms: int | None = None,
     utterance_end_timing_class: str = "not_evaluated",
+    stt_start_offset_ms: int | None = None,
+    stt_end_offset_ms: int | None = None,
+    canonical_accept_offset_ms: int | None = None,
+    canonical_accept_latency_class: str = "not_evaluated",
+    inflight_sink_cancellation_class: str = "not_applicable",
     presentation_class: str = "presentation_not_attempted",
     assistant_event_id: str | None = None,
     thought_core_first_event_elapsed_ms: int | None = None,
@@ -743,6 +748,11 @@ def build_live_candidate_window_response(
             utterance_end_to_candidate_result_ms
         ),
         "utterance_end_timing_class": utterance_end_timing_class,
+        "stt_start_offset_ms": stt_start_offset_ms,
+        "stt_end_offset_ms": stt_end_offset_ms,
+        "canonical_accept_offset_ms": canonical_accept_offset_ms,
+        "canonical_accept_latency_class": canonical_accept_latency_class,
+        "inflight_sink_cancellation_class": inflight_sink_cancellation_class,
         "presentation_class": presentation_class,
         "assistant_event_id": assistant_event_id,
         "thought_core_first_event_elapsed_ms": (
@@ -752,6 +762,32 @@ def build_live_candidate_window_response(
         "private_authority_residue_count": private_authority_residue_count,
         "raw_private_publication_flags": False,
     }
+
+
+def classify_canonical_accept_latency(offset_ms: int | None) -> str:
+    """Classify one accepted-turn offset without turning timing into authority."""
+    if offset_ms is None:
+        return "not_evaluated"
+    if offset_ms <= 2000:
+        return "within_2s_target"
+    if offset_ms <= 10_000:
+        return "over_2s_within_10s"
+    return "over_10s"
+
+
+def _offset_from_last_vad_frame_ms(
+    *,
+    capture_started_monotonic: float,
+    last_vad_speech_frame_offset_ms: int | None,
+    observed_monotonic: float,
+) -> int | None:
+    if last_vad_speech_frame_offset_ms is None:
+        return None
+    observed_from_capture_ms = max(
+        last_vad_speech_frame_offset_ms,
+        int((observed_monotonic - capture_started_monotonic) * 1000),
+    )
+    return observed_from_capture_ms - last_vad_speech_frame_offset_ms
 
 
 def execute_live_candidate_window(
@@ -764,6 +800,8 @@ def execute_live_candidate_window(
 ) -> dict[str, object]:
     """Own one private capture, gate decision, transcription and sink handoff."""
     started = time.monotonic()
+    route_deadline_monotonic = started + (deadline_ms / 1000)
+    capture_started_monotonic = started
     capture_window: LiveMicrophoneCandidateWindow | None = None
     transcript = ""
     packet_count = 0
@@ -779,6 +817,11 @@ def execute_live_candidate_window(
     last_vad_speech_frame_offset_ms: int | None = None
     utterance_end_to_candidate_result_ms: int | None = None
     utterance_end_timing_class = "not_evaluated"
+    stt_start_offset_ms: int | None = None
+    stt_end_offset_ms: int | None = None
+    canonical_accept_offset_ms: int | None = None
+    canonical_accept_latency_class = "not_evaluated"
+    inflight_sink_cancellation_class = "not_applicable"
     result_class = "live_candidate_window_failed"
     expectation_class = "not_evaluated"
     session: MicLoopSession | None = None
@@ -787,13 +830,23 @@ def execute_live_candidate_window(
     sink_result: object | None = None
     candidate: UserSpeechCandidateEvidence | None = None
     capability: object | None = None
+    source_epoch: object | None = None
     try:
+        source_epoch = input_gate.begin_live_input_source_epoch(
+            capture_started_monotonic=capture_started_monotonic,
+            deadline_ms=deadline_ms,
+        )
+        if source_epoch is None:
+            raise InputGateError("input_source_epoch_unavailable")
+        processing_mode_class = input_gate.live_input_source_epoch_processing_mode(
+            source_epoch
+        )
+        if processing_mode_class is None:
+            raise InputGateError("input_source_epoch_unavailable")
         capture_window = capture_live_microphone_candidate_window(
             window_ms=window_ms,
             deadline_ms=deadline_ms,
-            processing_mode_class=(
-                input_gate.live_capture_processing_mode_class()
-            ),
+            processing_mode_class=processing_mode_class,
         )
         packet_count = capture_window.packet_count
         byte_count = capture_window.processed_byte_count
@@ -822,12 +875,22 @@ def execute_live_candidate_window(
             packet_count=packet_count,
             processed_byte_count=byte_count,
             frame_bytes=capture_window.frame_bytes,
+            source_epoch=source_epoch,
+            speech_end_monotonic=(
+                capture_started_monotonic
+                + (last_vad_speech_frame_offset_ms / 1000)
+                if last_vad_speech_frame_offset_ms is not None
+                else None
+            ),
         )
         expected_acceptance = (
             scenario == "independent_current_session_user_speech"
         )
         actual_acceptance = candidate is not None
-        if expected_acceptance != actual_acceptance:
+        if has_speech and last_vad_speech_frame_offset_ms is None:
+            result_class = "speech_timing_observation_missing"
+            expectation_class = "not_evaluated"
+        elif expected_acceptance != actual_acceptance:
             result_class = "scenario_expectation_not_met"
             expectation_class = "mismatch"
         elif not expected_acceptance:
@@ -839,7 +902,16 @@ def execute_live_candidate_window(
             if capability is None:
                 result_class = "input_gate_capability_unavailable"
             else:
+                stt_start_offset_ms = _offset_from_last_vad_frame_ms(
+                    capture_started_monotonic=capture_started_monotonic,
+                    last_vad_speech_frame_offset_ms=(
+                        last_vad_speech_frame_offset_ms
+                    ),
+                    observed_monotonic=time.monotonic(),
+                )
                 pipeline = get_cached_transcription_pipeline()
+                if time.monotonic() > route_deadline_monotonic:
+                    raise InputGateError("live candidate deadline exceeded")
                 session = MicLoopSession(
                     pipeline=pipeline,
                     tuning=MicLoopTuning(
@@ -858,6 +930,17 @@ def execute_live_candidate_window(
                     candidate_evidence=candidate,
                     turn_input_capability=capability,
                 )
+                stt_completed_monotonic = time.monotonic()
+                stt_end_offset_ms = _offset_from_last_vad_frame_ms(
+                    capture_started_monotonic=capture_started_monotonic,
+                    last_vad_speech_frame_offset_ms=(
+                        last_vad_speech_frame_offset_ms
+                    ),
+                    observed_monotonic=stt_completed_monotonic,
+                )
+                route_deadline_expired = (
+                    stt_completed_monotonic > route_deadline_monotonic
+                )
                 transcript = transcription.text.strip()
                 candidate_audit = (
                     input_gate.build_consumed_candidate_audit(candidate)
@@ -866,6 +949,19 @@ def execute_live_candidate_window(
                 )
                 if not transcript or candidate_audit is None:
                     result_class = "private_transcription_not_accepted"
+                elif (
+                    stt_end_offset_ms is None
+                    or stt_start_offset_ms is None
+                ):
+                    result_class = "speech_timing_observation_missing"
+                elif stt_end_offset_ms > 10_000:
+                    result_class = "voice_response_latency_over_10s"
+                    canonical_accept_latency_class = "over_10s"
+                    inflight_sink_cancellation_class = (
+                        "pre_sink_over_10s_suppressed"
+                    )
+                elif route_deadline_expired:
+                    result_class = "live_candidate_window_failed"
                 elif not callable(private_turn_sink):
                     result_class = "private_turn_sink_unavailable"
                 else:
@@ -877,6 +973,27 @@ def execute_live_candidate_window(
                         sink_result
                     )
                     if validated_sink_result is not None:
+                        canonical_accept_offset_ms = (
+                            _offset_from_last_vad_frame_ms(
+                                capture_started_monotonic=(
+                                    capture_started_monotonic
+                                ),
+                                last_vad_speech_frame_offset_ms=(
+                                    last_vad_speech_frame_offset_ms
+                                ),
+                                observed_monotonic=time.monotonic(),
+                            )
+                        )
+                        canonical_accept_latency_class = (
+                            classify_canonical_accept_latency(
+                                canonical_accept_offset_ms
+                            )
+                        )
+                        inflight_sink_cancellation_class = (
+                            "inflight_sink_cancellation_not_proven"
+                            if canonical_accept_latency_class == "over_10s"
+                            else "not_required_within_10s"
+                        )
                         submission_count = 1
                         turninput_count = 1
                         presentation_class = str(
@@ -895,6 +1012,13 @@ def execute_live_candidate_window(
                         )
                     else:
                         result_class = "private_turn_sink_failed"
+    except InputGateError as exc:
+        failure_class = str(exc)
+        result_class = (
+            failure_class
+            if failure_class == "input_source_epoch_unavailable"
+            else "live_candidate_window_failed"
+        )
     except AudioEnvironmentError as exc:
         failure_class = str(exc)
         result_class = (
@@ -911,6 +1035,7 @@ def execute_live_candidate_window(
             input_gate.cancel_turn_input_capability(capability, candidate)
         if candidate is not None:
             input_gate.discard_consumed_candidate(candidate)
+            input_gate.discard_candidate(candidate)
         private_authority_residue_count = (
             input_gate.private_authority_residue_count()
         )
@@ -956,6 +1081,13 @@ def execute_live_candidate_window(
             utterance_end_to_candidate_result_ms
         ),
         utterance_end_timing_class=utterance_end_timing_class,
+        stt_start_offset_ms=stt_start_offset_ms,
+        stt_end_offset_ms=stt_end_offset_ms,
+        canonical_accept_offset_ms=canonical_accept_offset_ms,
+        canonical_accept_latency_class=canonical_accept_latency_class,
+        inflight_sink_cancellation_class=(
+            inflight_sink_cancellation_class
+        ),
         presentation_class=presentation_class,
         assistant_event_id=assistant_event_id,
         thought_core_first_event_elapsed_ms=(
