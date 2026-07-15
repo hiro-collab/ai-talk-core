@@ -5993,13 +5993,15 @@ class SmokeTests(unittest.TestCase):
     def test_live_candidate_endpoint_accepts_one_private_turn_without_echo(self) -> None:
         """One actual accepted candidate should transcribe and invoke the sink once."""
         private_marker = "private-live-transcript-marker-do-not-echo"
-        sink_calls: list[tuple[Mapping[str, object], str]] = []
+        sink_calls: list[tuple[Mapping[str, object], str, float]] = []
 
         def sink(
             candidate: Mapping[str, object],
             transcript: str,
+            *,
+            deadline_monotonic: float,
         ) -> Mapping[str, object]:
-            sink_calls.append((candidate, transcript))
+            sink_calls.append((candidate, transcript, deadline_monotonic))
             return {
                 "result_class": "thought_core_turninput_accepted",
                 "submission_count": 1,
@@ -6080,6 +6082,8 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(payload["presentation_class"], "aituber_presentation_forwarded")
         self.assertEqual(payload["assistant_event_id"], "evt-live-visible-1")
         self.assertEqual(payload["thought_core_first_event_elapsed_ms"], 125)
+        self.assertIsInstance(sink_calls[0][2], float)
+        self.assertGreater(sink_calls[0][2], 0)
         self.assertEqual(payload["signal_class"], "signal_above_floor")
         self.assertEqual(payload["vad_decision_class"], "speech_detected")
         self.assertEqual(payload["last_vad_speech_frame_offset_ms"], 40)
@@ -6146,8 +6150,9 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(payload["private_authority_residue_count"], 0)
         self.assertEqual(pcm, bytearray(len(pcm)))
         self.assertEqual(len(sink_calls), 1)
-        candidate_audit, transcript = sink_calls[0]
+        candidate_audit, transcript, deadline_monotonic = sink_calls[0]
         self.assertEqual(transcript, private_marker)
+        self.assertGreater(deadline_monotonic, 0)
         self.assertEqual(
             candidate_audit["schema_version"],
             "accepted_user_speech_candidate_input_gate.v0",
@@ -6334,11 +6339,43 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(
             _validate_live_candidate_sink_result(valid),
             {
+                "result_class": "thought_core_turninput_accepted",
+                "submission_count": 1,
+                "thought_core_turninput_count": 1,
                 "presentation_class": "aituber_presentation_forwarded",
                 "assistant_event_id": "evt-live-visible-1",
                 "thought_core_first_event_elapsed_ms": 125,
             },
         )
+        for fixed_result, expected_counts in (
+            (
+                "thought_core_turninput_rejected",
+                (0, 0),
+            ),
+            (
+                "thought_core_turninput_outcome_unknown",
+                (None, None),
+            ),
+        ):
+            with self.subTest(fixed_result=fixed_result):
+                fixed = {
+                    "result_class": fixed_result,
+                    "submission_count": expected_counts[0],
+                    "thought_core_turninput_count": expected_counts[1],
+                    "presentation_class": "presentation_not_attempted",
+                    "assistant_event_id": None,
+                    "thought_core_first_event_elapsed_ms": None,
+                    "raw_private_publication_flags": False,
+                }
+                validated = _validate_live_candidate_sink_result(fixed)
+                self.assertIsNotNone(validated)
+                self.assertEqual(
+                    (
+                        validated["submission_count"],
+                        validated["thought_core_turninput_count"],
+                    ),
+                    expected_counts,
+                )
         invalid_variants = (
             {**valid, "transcript": "private-do-not-echo"},
             {**valid, "assistant_event_id": "evt.private.marker"},
@@ -6354,10 +6391,135 @@ class SmokeTests(unittest.TestCase):
                     "aituber_presentation_forwarded_timing_unavailable"
                 ),
             },
+            {
+                "result_class": "thought_core_turninput_outcome_unknown",
+                "submission_count": 0,
+                "thought_core_turninput_count": 0,
+                "presentation_class": "presentation_not_attempted",
+                "assistant_event_id": None,
+                "thought_core_first_event_elapsed_ms": None,
+                "raw_private_publication_flags": False,
+            },
+            {
+                "result_class": "thought_core_turninput_outcome_unknown",
+                "submission_count": None,
+                "thought_core_turninput_count": None,
+                "presentation_class": "presentation_not_attempted",
+                "assistant_event_id": "private.marker",
+                "thought_core_first_event_elapsed_ms": None,
+                "raw_private_publication_flags": False,
+            },
+            {**valid, "result_class": []},
+            {**valid, "presentation_class": []},
         )
         for value in invalid_variants:
             with self.subTest(value=value):
                 self.assertIsNone(_validate_live_candidate_sink_result(value))
+
+    def test_live_candidate_execute_preserves_rejected_and_unknown_sink_counts(
+        self,
+    ) -> None:
+        fixed_cases = (
+            (
+                "thought_core_turninput_rejected",
+                0,
+                0,
+                "private_turn_sink_rejected",
+            ),
+            (
+                "thought_core_turninput_outcome_unknown",
+                None,
+                None,
+                "private_turn_sink_outcome_unknown",
+            ),
+        )
+        for sink_class, submission_count, turninput_count, result_class in fixed_cases:
+            with self.subTest(sink_class=sink_class):
+                sink = mock.Mock(
+                    return_value={
+                        "result_class": sink_class,
+                        "submission_count": submission_count,
+                        "thought_core_turninput_count": turninput_count,
+                        "presentation_class": "presentation_not_attempted",
+                        "assistant_event_id": None,
+                        "thought_core_first_event_elapsed_ms": None,
+                        "raw_private_publication_flags": False,
+                    }
+                )
+                app = create_app(private_turn_sink=sink)
+                app.config[ENABLE_PROCESS_SHUTDOWN_CONFIG] = False
+                client = app.test_client()
+                headers = {"X-AI-Core-Token": app.config["LOCAL_API_TOKEN"]}
+                post_current_lifecycle_events(client, headers)
+                pcm = bytearray(b"\x21\x00" * 160)
+                capture_window = LiveMicrophoneCandidateWindow(
+                    chunk=AudioChunk(
+                        path=None,
+                        source="microphone",
+                        pcm16=pcm,
+                        sample_rate=16_000,
+                        storage_class="in_memory_ephemeral",
+                        turn_input_authority=False,
+                        turn_input_authority_class=(
+                            "processed_near_end_observation_only"
+                        ),
+                    ),
+                    packet_count=1,
+                    window_ms=100,
+                )
+                pipeline = mock.Mock()
+                pipeline._transcribe_private_buffer_result.return_value = (
+                    TranscriptionResult(
+                        source="microphone",
+                        text="private-do-not-echo",
+                        is_final=False,
+                        chunk_count=1,
+                    )
+                )
+                with (
+                    mock.patch(
+                        "src.web.app.capture_live_microphone_candidate_window",
+                        return_value=capture_window,
+                    ),
+                    mock.patch(
+                        "src.web.app.has_detectable_speech_pcm16",
+                        return_value=True,
+                    ),
+                    mock.patch(
+                        "src.web.app.find_last_vad_speech_frame_offset_ms",
+                        return_value=40,
+                    ),
+                    mock.patch(
+                        "src.web.app.get_cached_transcription_pipeline",
+                        return_value=pipeline,
+                    ),
+                ):
+                    response = client.post(
+                        "/api/live-input-gate/candidate-window",
+                        headers=headers,
+                        json={
+                            "scenario": (
+                                "independent_current_session_user_speech"
+                            ),
+                            "window_ms": 100,
+                            "deadline_ms": 1000,
+                        },
+                    )
+
+                self.assertEqual(response.status_code, 503)
+                payload = response.get_json()
+                self.assertEqual(payload["result_class"], result_class)
+                self.assertIs(payload["submission_count"], submission_count)
+                self.assertIs(
+                    payload["thought_core_turninput_count"],
+                    turninput_count,
+                )
+                self.assertNotIn("private-do-not-echo", response.get_data(as_text=True))
+                self.assertIsInstance(
+                    sink.call_args.kwargs["deadline_monotonic"],
+                    float,
+                )
+                self.assertEqual(pcm, bytearray(len(pcm)))
 
     def test_live_candidate_scenario_is_expectation_only(self) -> None:
         """Scenario labels must never force acceptance or classification."""

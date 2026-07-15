@@ -169,6 +169,8 @@ LIVE_CANDIDATE_PRESENTATION_CLASSES = {
     "aituber_presentation_forwarded",
     "aituber_presentation_forwarded_timing_unavailable",
     "aituber_presentation_not_forwarded",
+    "aituber_presentation_skipped_deadline",
+    "aituber_presentation_skipped_after_completion",
 }
 LIVE_CANDIDATE_ASSISTANT_EVENT_ID_PATTERN = re.compile(
     r"^[A-Za-z0-9_.:-]{1,128}$"
@@ -287,7 +289,7 @@ def create_app(
     runtime_status_writer: RuntimeStatusWriter | None = None,
     started_at: str | None = None,
     private_turn_sink: (
-        Callable[[Mapping[str, object], str], Mapping[str, object]] | None
+        Callable[..., Mapping[str, object]] | None
     ) = None,
 ) -> Flask:
     """Create the local Flask application."""
@@ -713,8 +715,8 @@ def build_live_candidate_window_response(
     signal_class: str = "not_evaluated",
     vad_decision_class: str = "not_evaluated",
     transcription_count: int = 0,
-    submission_count: int = 0,
-    thought_core_turninput_count: int = 0,
+    submission_count: int | None = 0,
+    thought_core_turninput_count: int | None = 0,
     elapsed_ms: int = 0,
     last_vad_speech_frame_offset_ms: int | None = None,
     utterance_end_to_candidate_result_ms: int | None = None,
@@ -809,8 +811,8 @@ def execute_live_candidate_window(
     signal_class = "not_evaluated"
     vad_decision_class = "not_evaluated"
     transcription_count = 0
-    submission_count = 0
-    turninput_count = 0
+    submission_count: int | None = 0
+    turninput_count: int | None = 0
     presentation_class = "presentation_not_attempted"
     assistant_event_id: str | None = None
     thought_core_first_event_elapsed_ms: int | None = None
@@ -966,13 +968,21 @@ def execute_live_candidate_window(
                     result_class = "private_turn_sink_unavailable"
                 else:
                     try:
-                        sink_result = private_turn_sink(candidate_audit, transcript)
+                        sink_result = private_turn_sink(
+                            candidate_audit,
+                            transcript,
+                            deadline_monotonic=route_deadline_monotonic,
+                        )
                     except Exception:
                         sink_result = None
                     validated_sink_result = _validate_live_candidate_sink_result(
                         sink_result
                     )
-                    if validated_sink_result is not None:
+                    if (
+                        validated_sink_result is not None
+                        and validated_sink_result["result_class"]
+                        == "thought_core_turninput_accepted"
+                    ):
                         canonical_accept_offset_ms = (
                             _offset_from_last_vad_frame_ms(
                                 capture_started_monotonic=(
@@ -994,8 +1004,12 @@ def execute_live_candidate_window(
                             if canonical_accept_latency_class == "over_10s"
                             else "not_required_within_10s"
                         )
-                        submission_count = 1
-                        turninput_count = 1
+                        submission_count = validated_sink_result[
+                            "submission_count"
+                        ]
+                        turninput_count = validated_sink_result[
+                            "thought_core_turninput_count"
+                        ]
                         presentation_class = str(
                             validated_sink_result["presentation_class"]
                         )
@@ -1010,6 +1024,20 @@ def execute_live_candidate_window(
                         result_class = (
                             "independent_user_speech_turninput_accepted"
                         )
+                    elif (
+                        validated_sink_result is not None
+                        and validated_sink_result["result_class"]
+                        == "thought_core_turninput_outcome_unknown"
+                    ):
+                        submission_count = None
+                        turninput_count = None
+                        presentation_class = "presentation_not_attempted"
+                        inflight_sink_cancellation_class = (
+                            "inflight_sink_outcome_unknown"
+                        )
+                        result_class = "private_turn_sink_outcome_unknown"
+                    elif validated_sink_result is not None:
+                        result_class = "private_turn_sink_rejected"
                     else:
                         result_class = "private_turn_sink_failed"
     except InputGateError as exc:
@@ -1103,22 +1131,56 @@ def _validate_live_candidate_sink_result(
 ) -> dict[str, object] | None:
     if not isinstance(value, Mapping) or set(value) != LIVE_CANDIDATE_SINK_RESULT_FIELDS:
         return None
-    if (
-        value.get("result_class") != "thought_core_turninput_accepted"
-        or value.get("submission_count") != 1
-        or isinstance(value.get("submission_count"), bool)
-        or value.get("thought_core_turninput_count") != 1
-        or isinstance(value.get("thought_core_turninput_count"), bool)
-        or value.get("raw_private_publication_flags") is not False
-    ):
+    if value.get("raw_private_publication_flags") is not False:
         return None
 
+    result_class = value.get("result_class")
+    submission_count = value.get("submission_count")
+    turninput_count = value.get("thought_core_turninput_count")
     presentation_class = value.get("presentation_class")
     assistant_event_id = value.get("assistant_event_id")
     first_event_elapsed_ms = value.get("thought_core_first_event_elapsed_ms")
-    if presentation_class not in LIVE_CANDIDATE_PRESENTATION_CLASSES:
+    fixed_nonaccepted = {
+        "thought_core_turninput_rejected": (0, 0),
+        "thought_core_turninput_outcome_unknown": (None, None),
+    }
+    if isinstance(result_class, str) and result_class in fixed_nonaccepted:
+        if (
+            (submission_count, turninput_count) != fixed_nonaccepted[result_class]
+            or isinstance(submission_count, bool)
+            or isinstance(turninput_count, bool)
+            or presentation_class != "presentation_not_attempted"
+            or assistant_event_id is not None
+            or first_event_elapsed_ms is not None
+        ):
+            return None
+        return {
+            "result_class": result_class,
+            "submission_count": submission_count,
+            "thought_core_turninput_count": turninput_count,
+            "presentation_class": presentation_class,
+            "assistant_event_id": None,
+            "thought_core_first_event_elapsed_ms": None,
+        }
+
+    if (
+        result_class != "thought_core_turninput_accepted"
+        or submission_count != 1
+        or isinstance(submission_count, bool)
+        or turninput_count != 1
+        or isinstance(turninput_count, bool)
+    ):
         return None
-    if presentation_class == "aituber_presentation_not_forwarded":
+    if (
+        not isinstance(presentation_class, str)
+        or presentation_class not in LIVE_CANDIDATE_PRESENTATION_CLASSES
+    ):
+        return None
+    if presentation_class in {
+        "aituber_presentation_not_forwarded",
+        "aituber_presentation_skipped_deadline",
+        "aituber_presentation_skipped_after_completion",
+    }:
         if assistant_event_id is not None or first_event_elapsed_ms is not None:
             return None
     else:
@@ -1145,6 +1207,9 @@ def _validate_live_candidate_sink_result(
             return None
 
     return {
+        "result_class": result_class,
+        "submission_count": submission_count,
+        "thought_core_turninput_count": turninput_count,
         "presentation_class": presentation_class,
         "assistant_event_id": assistant_event_id,
         "thought_core_first_event_elapsed_ms": first_event_elapsed_ms,
